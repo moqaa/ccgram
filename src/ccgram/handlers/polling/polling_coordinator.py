@@ -87,7 +87,7 @@ async def status_poll_loop(bot: "Bot") -> None:
     poll_interval = _cfg.status_poll_interval
     client = PTBTelegramClient(bot)
     logger.info("Status polling started (interval: %ss)", poll_interval)
-    timers = {"topic_check": 0.0, "live_view": 0.0}
+    timers = {"topic_check": 0.0, "live_view": 0.0, "topic_name_sync": 0.0}
     _error_streak = 0
     while True:
         try:

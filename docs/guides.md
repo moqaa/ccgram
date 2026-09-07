@@ -222,6 +222,7 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_STATUS_MODE` / `--status-mode`               | `system`                       | Topic emoji color scheme: `system` (green=working) or `user` (green=ready)                           |
 | `CCGRAM_HIDE_TOOL_CALLS` / `--hide-tool-calls`       | `false`                        | Set `true` to globally hide `tool_use`/`tool_result` messages (per-window override via `/toolcalls`) |
 | `CCGRAM_HIDE_THINKING` / `--hide-thinking`           | `false`                        | Set `true` to globally hide thinking messages                                                        |
+| `CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW`                 | `false`                        | Set `true` to push multiplexer window renames to the bound topic title (see Topic Name Sync)         |
 | `CCGRAM_HIDE_STATUS`                                 | `false`                        | Set `true` to suppress transient status bubbles; replies and controls remain available              |
 | `CCGRAM_VOICE_AUTOSEND`                              | `false`                        | Set `true` to send voice transcriptions without confirmation; transcription is still shown           |
 | `CCGRAM_PROMPT_MODE` / `--prompt-mode`               | `wrap`                         | Shell prompt marker: `wrap` (append `⌘N⌘`) or `replace` (legacy `{prefix}:N❯`)                       |
@@ -300,6 +301,18 @@ The raw provider transcript is retained; Jump to live does not delete or rewrite
 By default, thinking messages are forwarded to Telegram. Set `CCGRAM_HIDE_THINKING=true` or use `--hide-thinking` to hide them globally.
 
 This option does not hide responses, tool messages, or hook events. It has no per-window override.
+
+## Topic Name Sync
+
+Renaming a Telegram topic always renames the bound multiplexer window. The reverse
+direction is opt-in: set `CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW=true` and a window
+rename (`tmux rename-window`, a herdr tab rename) is pushed to the topic title within
+about ten seconds. Without it, the title only refreshes on the next agent status
+change, so an idle window's rename never reaches Telegram.
+
+The new name must be seen on two consecutive 5-second checks before it is sent, so a
+shell window whose name follows `automatic-rename` does not spend the per-chat edit
+budget while it `cd`s around. Names starting with `_` are never pushed.
 
 ## Voice Message Transcription
 
