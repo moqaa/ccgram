@@ -539,6 +539,7 @@ async def topic_edited_handler(
     if renamed:
         session_manager.set_display_name(window_id, clean_name)
         update_stored_topic_name(chat_id, thread_id, clean_name)
+        _synced_window_names[window_id] = clean_name
         logger.info(
             "Topic renamed: window %s → %r (thread=%d)",
             window_id,
@@ -556,6 +557,12 @@ TOPIC_NAME_STABLE_TICKS = 2
 
 # window_id → (last live name seen, consecutive checks it was seen)
 _pending_window_names: dict[str, tuple[str, int]] = {}
+
+# window_id → the last name known to be on the Telegram topic, kept by this
+# module because the display name is not a stable baseline: prune_stale_state
+# refreshes it from the live window every 60s without touching Telegram, which
+# would erase a rename seen only once before that refresh.
+_synced_window_names: dict[str, str] = {}
 
 
 async def sync_topic_names_from_windows(
@@ -575,8 +582,14 @@ async def sync_topic_names_from_windows(
         live_name = live_names.get(canonical_window_id(window_id), "")
         if not live_name or live_name.startswith("_"):
             continue
-        current = thread_router.get_display_name(window_id)
-        if current == window_id or strip_emoji_prefix(current) == live_name:
+        current = _synced_window_names.get(window_id)
+        if current is None:
+            display = thread_router.get_display_name(window_id)
+            if display == window_id:
+                continue
+            current = strip_emoji_prefix(display)
+            _synced_window_names[window_id] = current
+        if current == live_name:
             continue
 
         seen_name, ticks = _pending_window_names.get(window_id, ("", 0))
@@ -589,6 +602,7 @@ async def sync_topic_names_from_windows(
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         await sync_topic_name(client, chat_id, thread_id, live_name)
         session_manager.set_display_name(window_id, live_name)
+        _synced_window_names[window_id] = live_name
         logger.info(
             "Window renamed: %s %r → %r pushed to topic (thread=%d)",
             window_id,

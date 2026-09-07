@@ -17,8 +17,10 @@ WINDOW_ID = "@33"
 @pytest.fixture(autouse=True)
 def _reset_pending():
     topic_lifecycle._pending_window_names.clear()
+    topic_lifecycle._synced_window_names.clear()
     yield
     topic_lifecycle._pending_window_names.clear()
+    topic_lifecycle._synced_window_names.clear()
 
 
 @pytest.fixture
@@ -61,6 +63,20 @@ class TestRenamePushedToTelegram:
 
         sync.assert_awaited_once_with(client, CHAT_ID, THREAD_ID, "new-name")
         session.set_display_name.assert_called_once_with(WINDOW_ID, "new-name")
+
+    async def test_display_name_refresh_between_ticks_does_not_swallow_rename(
+        self, router: MagicMock, session: MagicMock, sync: AsyncMock
+    ) -> None:
+        """prune_stale_state copies the live name into the display name every
+        60s without touching Telegram; a rename seen once before that refresh
+        must still be pushed on the next tick."""
+        client = MagicMock()
+
+        await sync_topic_names_from_windows(client, [_window("new-name")])
+        router.get_display_name.return_value = "new-name"  # the 60s refresh ran
+        await sync_topic_names_from_windows(client, [_window("new-name")])
+
+        sync.assert_awaited_once_with(client, CHAT_ID, THREAD_ID, "new-name")
 
     async def test_name_that_settles_after_churn_is_pushed_once(
         self, router: MagicMock, session: MagicMock, sync: AsyncMock
