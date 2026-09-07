@@ -189,6 +189,23 @@ class TestHideThinking:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestSyncTopicNameFromWindow:
+    def test_default_false(self, monkeypatch):
+        monkeypatch.delenv("CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW", raising=False)
+        assert Config().sync_topic_name_from_window is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "YES"])
+    def test_enabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW", value)
+        assert Config().sync_topic_name_from_window is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off"])
+    def test_disabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW", value)
+        assert Config().sync_topic_name_from_window is False
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestStatusMode:
     def test_default_is_system(self, monkeypatch):
         monkeypatch.delenv("CCGRAM_STATUS_MODE", raising=False)

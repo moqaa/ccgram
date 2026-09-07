@@ -22,6 +22,7 @@ from ..topics.topic_lifecycle import (
     check_unbound_window_ttl,
     probe_topic_existence,
     prune_stale_state,
+    sync_topic_names_from_windows,
 )
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ logger = structlog.get_logger()
 # ── Timing constants ──────────────────────────────────────────────────────
 
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+TOPIC_NAME_SYNC_INTERVAL = 5.0  # seconds
 
 
 # ── Orchestration ──────────────────────────────────────────────────────────
@@ -42,12 +44,19 @@ async def run_periodic_tasks(
     all_windows: list["TmuxWindow"],
     timers: dict[str, float],
 ) -> None:
-    """Run time-gated periodic tasks (topic check, live view)."""
+    """Run time-gated periodic tasks (topic check, live view, name sync)."""
     now = time.monotonic()
 
     if now - timers["live_view"] >= config.live_view_interval:
         timers["live_view"] = now
         await tick_live_views(client)
+
+    if (
+        config.sync_topic_name_from_window
+        and now - timers["topic_name_sync"] >= TOPIC_NAME_SYNC_INTERVAL
+    ):
+        timers["topic_name_sync"] = now
+        await sync_topic_names_from_windows(client, all_windows)
 
     if now - timers["topic_check"] >= TOPIC_CHECK_INTERVAL:
         timers["topic_check"] = now

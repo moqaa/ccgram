@@ -31,6 +31,7 @@ def _tasks(now: float):
     ):
         mock_time.monotonic.return_value = now
         mock_config.live_view_interval = _LIVE_VIEW_INTERVAL
+        mock_config.sync_topic_name_from_window = False
         yield MagicMock(
             live=live,
             prune=prune,
@@ -85,6 +86,53 @@ class TestRunPeriodicTasks:
 
         tasks.prune.assert_awaited_once_with(windows)
         tasks.probe.assert_awaited_once_with(client)
+
+
+class TestTopicNameSync:
+    @contextmanager
+    def _name_sync(self, now: float, *, enabled: bool):
+        with (
+            _tasks(now=now) as tasks,
+            patch(_MODULE + "config") as mock_config,
+            patch(
+                _MODULE + "sync_topic_names_from_windows", new_callable=AsyncMock
+            ) as name_sync,
+        ):
+            mock_config.live_view_interval = _LIVE_VIEW_INTERVAL
+            mock_config.sync_topic_name_from_window = enabled
+            tasks.name_sync = name_sync
+            yield tasks
+
+    @pytest.mark.parametrize(
+        ("elapsed_fraction", "expected"),
+        [
+            pytest.param(0.9, False, id="within-interval"),
+            pytest.param(1.0, True, id="exactly-at-interval"),
+        ],
+    )
+    async def test_is_interval_gated_when_enabled(self, elapsed_fraction, expected):
+        from ccgram.handlers.polling import periodic_tasks
+
+        elapsed = periodic_tasks.TOPIC_NAME_SYNC_INTERVAL * elapsed_fraction
+        timers = {"live_view": 1e9, "topic_check": 1e9, "topic_name_sync": 0.0}
+        windows = cast(list[WindowRef], [MagicMock()])
+        client = MagicMock()
+        with self._name_sync(now=elapsed, enabled=True) as tasks:
+            await run_periodic_tasks(client, windows, timers)
+
+        if expected:
+            tasks.name_sync.assert_awaited_once_with(client, windows)
+        else:
+            tasks.name_sync.assert_not_awaited()
+        assert timers["topic_name_sync"] == (elapsed if expected else 0.0)
+
+    async def test_never_runs_when_disabled(self):
+        timers = {"live_view": 1e9, "topic_check": 1e9, "topic_name_sync": 0.0}
+        with self._name_sync(now=1e6, enabled=False) as tasks:
+            await run_periodic_tasks(MagicMock(), [], timers)
+
+        tasks.name_sync.assert_not_awaited()
+        assert timers["topic_name_sync"] == 0.0
 
 
 class TestRunLifecycleTasks:

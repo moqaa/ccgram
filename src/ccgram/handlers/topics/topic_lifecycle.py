@@ -545,3 +545,58 @@ async def topic_edited_handler(
             clean_name,
             thread_id,
         )
+
+
+# ── Window name → topic name sync (reverse of topic_edited_handler) ─────────
+
+# A changed live name must be observed on this many consecutive checks before
+# it is pushed, so automatic-rename churn (a shell cd-ing around) does not spend
+# the per-chat Telegram edit budget that topic_emoji also draws on.
+TOPIC_NAME_STABLE_TICKS = 2
+
+# window_id → (last live name seen, consecutive checks it was seen)
+_pending_window_names: dict[str, tuple[str, int]] = {}
+
+
+async def sync_topic_names_from_windows(
+    client: TelegramClient, live_windows: "list[TmuxWindow]"
+) -> None:
+    """Push a renamed multiplexer window's name to its bound Telegram topic.
+
+    The Telegram title is otherwise only recomposed on the next status-emoji
+    transition, so an idle window that is renamed never reaches Telegram.
+    """
+    # Lazy: handlers.status.topic_emoji ↔ topics cycle (as topic_edited_handler).
+    from ..status.topic_emoji import strip_emoji_prefix, sync_topic_name
+
+    live_names = {canonical_window_id(w.window_id): w.window_name for w in live_windows}
+    still_pending: set[str] = set()
+    for user_id, thread_id, window_id in thread_router.iter_thread_bindings():
+        live_name = live_names.get(canonical_window_id(window_id), "")
+        if not live_name or live_name.startswith("_"):
+            continue
+        current = thread_router.get_display_name(window_id)
+        if current == window_id or strip_emoji_prefix(current) == live_name:
+            continue
+
+        seen_name, ticks = _pending_window_names.get(window_id, ("", 0))
+        ticks = ticks + 1 if seen_name == live_name else 1
+        if ticks < TOPIC_NAME_STABLE_TICKS:
+            _pending_window_names[window_id] = (live_name, ticks)
+            still_pending.add(window_id)
+            continue
+
+        chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+        await sync_topic_name(client, chat_id, thread_id, live_name)
+        session_manager.set_display_name(window_id, live_name)
+        logger.info(
+            "Window renamed: %s %r → %r pushed to topic (thread=%d)",
+            window_id,
+            current,
+            live_name,
+            thread_id,
+        )
+
+    for window_id in list(_pending_window_names):
+        if window_id not in still_pending:
+            del _pending_window_names[window_id]

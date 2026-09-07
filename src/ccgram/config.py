@@ -245,6 +245,11 @@ class Config:
         self.pane_lifecycle_notify: bool = os.getenv(
             "CCGRAM_PANE_LIFECYCLE_NOTIFY", ""
         ).lower() in ("1", "true", "yes")
+        # Push multiplexer window renames to the bound Telegram topic title.
+        # Off by default: the title otherwise only refreshes on a status change.
+        self.sync_topic_name_from_window: bool = os.getenv(
+            "CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW", "false"
+        ).lower() in ("1", "true", "yes")
         self._init_miniapp()
 
     def _init_miniapp(self) -> None:
