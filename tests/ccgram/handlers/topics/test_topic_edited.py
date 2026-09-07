@@ -92,6 +92,19 @@ class TestTopicEditedRenamesWindow:
 
         assert _topic_names[(CHAT_ID, THREAD_ID)] == "new-name"
 
+    async def test_records_name_as_synced_so_reverse_sync_does_not_echo(
+        self, mux: MagicMock, router: MagicMock, session: MagicMock
+    ) -> None:
+        from ccgram.handlers.topics import topic_lifecycle
+
+        topic_lifecycle._synced_window_names.clear()
+        router.get_window_for_chat_thread.return_value = "@0"
+        router.get_display_name.return_value = "old-name"
+
+        await topic_edited_handler(_make_update("new-name"), MagicMock())
+
+        assert topic_lifecycle._synced_window_names["@0"] == "new-name"
+
 
 class TestTopicEditedIgnoredEdits:
     async def test_ignores_emoji_only_change(
