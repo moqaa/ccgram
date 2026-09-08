@@ -584,7 +584,16 @@ class TestTabDelimitedParsing:
         mock_result = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=tmux_output + "\n", stderr=""
         )
-        with patch("ccgram.hook.subprocess.run", return_value=mock_result):
+
+        def _fake_run(args, **_kwargs):
+            # The session_map key probe asks ccgram's session for its window
+            # list; a blanket mock would hand it the display-message output and
+            # make every window look like it lives in ccgram's session.
+            if len(args) > 1 and args[1] == "list-windows":
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return mock_result
+
+        with patch("ccgram.hook.subprocess.run", side_effect=_fake_run):
             hook_main()
 
         session_map = json.loads((tmp_path / "session_map.json").read_text())
@@ -720,6 +729,33 @@ class TestSessionMapKeyForLinkedWindow:
             "@34",
             "code",
             "/dev/ttys001",
+        )
+
+    def test_grouped_session_window_keys_under_ccgram_session(
+        self, monkeypatch
+    ) -> None:
+        """A pane in a session *grouped* with ccgram's session (tmux
+        ``new-session -t main``) shares main's window list without linking the
+        windows, so tmux reports ``window_linked_sessions=1``. The key must
+        still resolve to ccgram's session or the binding is never found.
+        """
+        monkeypatch.setattr(config, "tmux_session_name", "ccgram")
+
+        def _fake_run(args, **_kwargs):
+            if args[1] == "display-message":
+                return subprocess.CompletedProcess(
+                    args, 0, "wt-1788881488-004\t@1\tcode\t/dev/ttys003\t1\n", ""
+                )
+            if args[1] == "list-windows":
+                return subprocess.CompletedProcess(args, 0, "@1\n", "")
+            pytest.fail(f"unexpected command: {args}")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert _resolve_window_id("%1") == (
+            "ccgram:@1",
+            "@1",
+            "code",
+            "/dev/ttys003",
         )
 
     def test_unlinked_window_keeps_pane_session(self, monkeypatch) -> None:
@@ -1047,6 +1083,27 @@ class TestProviderFromPaneTty:
         )
         with patch("ccgram.hook.subprocess.run", return_value=result):
             assert _provider_from_pane_tty("/dev/ttys012") == provider
+
+    def test_unrelated_path_mentioning_another_agent_is_not_the_provider(
+        self,
+    ) -> None:
+        """A provider name buried in a *path* is not a running agent.
+
+        claude-mem's helper carries ``~/.codex/plugins/cache/claude-mem-local``
+        on its command line, so a substring scan of the whole tty process list
+        reports ``codex`` for every Claude pane that has claude-mem loaded.
+        """
+        ps_text = (
+            "-zsh\n"
+            "claude --dangerously-skip-permissions\n"
+            'node -e const h=o.homedir();L(p.join(h,".codex/plugins/cache/'
+            'claude-mem-local/claude-mem"))\n'
+        )
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=ps_text, stderr=""
+        )
+        with patch("ccgram.hook.subprocess.run", return_value=result):
+            assert _provider_from_pane_tty("/dev/ttys003") == "claude"
 
     def test_empty_tty_returns_none(self) -> None:
         assert _provider_from_pane_tty("") is None

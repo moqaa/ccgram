@@ -58,6 +58,10 @@ _PATH_HOOK_MARKER = "ccgram hook"
 _TMUX_FORMAT_PARTS = 3
 _TMUX_FORMAT_PARTS_WITH_TTY = 4
 _TMUX_FORMAT_PARTS_WITH_LINKS = 5
+# Providers detectable by executable name on a tty, in precedence order. ``pi``
+# is matched separately: it is short enough to collide (pip, pipenv) and so is
+# only ever accepted as an exact basename.
+_TTY_PROVIDERS: tuple[ProviderName, ...] = ("gemini", "codex", "claude")
 
 # ps -A output is split into 5 fields: pid, ppid, pgid, stat, command.
 _PS_SNAPSHOT_FIELDS = 5
@@ -828,10 +832,13 @@ def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
 
     tmux_session_name, window_id, window_name = parts[0], parts[1], parts[2]
     pane_tty = parts[3] if len(parts) >= _TMUX_FORMAT_PARTS_WITH_TTY else ""
-    linked = parts[4] if len(parts) >= _TMUX_FORMAT_PARTS_WITH_LINKS else ""
-    key_session = tmux_session_name
-    if linked not in ("", "0", "1"):
-        key_session = _session_map_session_for(window_id, tmux_session_name)
+    # ``window_linked_sessions`` is not the signal for "needs remapping":
+    # a session *grouped* with ccgram's (``tmux new-session -t main``) shares
+    # main's window list without linking the windows, so tmux reports 1 while
+    # the pane's session name still differs. ``_session_map_session_for``
+    # early-returns when the pane already sits in ccgram's session, so the
+    # tmux probe this once guarded is only paid when it is actually needed.
+    key_session = _session_map_session_for(window_id, tmux_session_name)
     session_window_key = f"{key_session}:{window_id}"
     return session_window_key, window_id, window_name, pane_tty
 
@@ -1305,12 +1312,24 @@ def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
     except subprocess.TimeoutExpired, OSError:
         return None
     text = result.stdout.lower()
-    if "gemini" in text:
-        return "gemini"
-    if "codex" in text:
-        return "codex"
-    if "claude" in text:
-        return "claude"
+    # Prefer the executable actually running on the tty. A provider name can
+    # also appear in an unrelated *path* on some other process's command line
+    # (claude-mem's helper carries ``~/.codex/plugins/cache/claude-mem-local``
+    # on every Claude pane), and a whole-text substring scan reads that as the
+    # running agent. Basenames are checked first for that reason; the scan is
+    # kept as a fallback so wrapper launches (``node .../claude/cli.js``) that
+    # expose no provider basename still resolve as they did before.
+    executables = {
+        line.split()[0].rsplit("/", 1)[-1] for line in text.splitlines() if line.split()
+    }
+    for name in _TTY_PROVIDERS:
+        if name in executables:
+            return name
+    if "pi" in executables:
+        return "pi"
+    for name in _TTY_PROVIDERS:
+        if name in text:
+            return name
     if any(tok == "pi" or tok.endswith("/pi") for tok in text.split()):
         return "pi"
     return None
