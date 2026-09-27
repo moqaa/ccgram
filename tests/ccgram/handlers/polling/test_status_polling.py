@@ -114,6 +114,7 @@ class TestAutocloseTimers:
         ):
             mock_config.autoclose_done_minutes = 30
             mock_config.autoclose_dead_minutes = minutes
+            mock_config.delete_dead_topics = False  # opt-in; a MagicMock is truthy
             mock_time.monotonic.return_value = elapsed
             mock_tr.resolve_chat_id.return_value = -100
             await check_autoclose_timers(bot)

@@ -450,6 +450,8 @@ Set to `0` to disable:
 ccgram --autoclose-done 0 --autoclose-dead 0
 ```
 
+Closed topics stay in the topic list, and `/sync` does not clean up topics retired this way. To **delete** a dead session's topic instead of closing it, set `CCGRAM_DELETE_DEAD_TOPICS=true` (off by default). It applies only when the dead timer expires and the window is confirmed gone. Done topics and topics of live windows are still only closed. If the delete is refused (for example, the bot lacks **Manage Topics**), the topic is closed as before. Deletion is irreversible and removes the topic's Telegram history; agent transcripts on disk are untouched.
+
 ## Multi-Instance Setup
 
 Run multiple ccgram instances on the same machine, each owning a different Telegram group. All instances can share a single bot token. Because Telegram rate limits are token-wide, divide the expected aggregate traffic across instances; these processes do not share a rate-limit coordinator.
