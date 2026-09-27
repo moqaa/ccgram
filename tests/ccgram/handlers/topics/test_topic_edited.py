@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ccgram.handlers.status.topic_emoji import _topic_names, reset_all_state
+from ccgram.handlers.topics import requested_topic_names
 from ccgram.handlers.topics.topic_lifecycle import topic_edited_handler
 
 CHAT_ID = -100
@@ -14,8 +15,10 @@ THREAD_ID = 42
 @pytest.fixture(autouse=True)
 def _reset():
     reset_all_state()
+    requested_topic_names.reset()
     yield
     reset_all_state()
+    requested_topic_names.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -147,3 +150,15 @@ class TestTopicEditedIgnoredEdits:
 
         assert _topic_names[(CHAT_ID, THREAD_ID)] == "old-name"
         router.set_display_name.assert_not_called()
+
+
+class TestTopicEditedBeforeAWindowExists:
+    async def test_rename_of_an_unbound_topic_is_remembered_for_its_window(
+        self, mux: MagicMock, router: MagicMock, session: MagicMock
+    ) -> None:
+        router.get_window_for_chat_thread.return_value = None
+
+        await topic_edited_handler(_make_update("invoices"), MagicMock())
+
+        assert requested_topic_names.requested_name(CHAT_ID, THREAD_ID) == "invoices"
+        mux.rename_window.assert_not_awaited()

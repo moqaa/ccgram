@@ -5,6 +5,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from ccgram.handlers.topics import requested_topic_names
 from ccgram.handlers.text.text_handler import (
     PENDING_DELIVERY_NOTICE,
     _bash_capture_tasks,
@@ -148,6 +149,18 @@ class TestHandleUnboundTopic:
         assert user_data[PENDING_THREAD_TEXT] == "my text"
         assert unbound_env.reply.call_count == 2
         assert unbound_env.reply.call_args_list[1].args[1] == PENDING_DELIVERY_NOTICE
+
+    async def test_unbound_topic_remembers_the_name_it_was_created_with(
+        self, unbound_env: SimpleNamespace
+    ) -> None:
+        message = AsyncMock()
+        message.chat.id = -100
+        message.message_thread_id = 42
+        message.reply_to_message.forum_topic_created.name = "invoices"
+
+        await _handle_unbound_topic(100, 42, "my text", {}, message)
+
+        assert requested_topic_names.requested_name(-100, 42) == "invoices"
 
 
 class TestHandleDeadWindow:

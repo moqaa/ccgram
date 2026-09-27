@@ -10,6 +10,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 
 from ccgram.multiplexer.base import TopicTargetResult
+from ccgram.handlers.topics import requested_topic_names
 from ccgram.handlers.topics.window_launch_service import (
     WindowLaunchRequest,
     _create_topic_window,
@@ -27,6 +28,13 @@ from ccgram.handlers.user_state import (
 )
 
 _MODULE = "ccgram.handlers.topics.window_launch_service."
+
+
+@pytest.fixture(autouse=True)
+def _reset_requested_names():
+    requested_topic_names.reset()
+    yield
+    requested_topic_names.reset()
 
 
 # ── _cwd_within ──────────────────────────────────────────────────────────────
@@ -206,7 +214,23 @@ class TestCreateTopicWindow:
 
         assert result == (True, "ok", "proj", "@7")
         mux.create_window.assert_awaited_once_with(
-            "/proj", launch_command="claude", workspace_id="ws1"
+            "/proj", window_name=None, launch_command="claude", workspace_id="ws1"
+        )
+
+    async def test_tmux_backend_names_the_window_when_a_name_is_given(self) -> None:
+        context = MagicMock()
+        context.user_data = {}
+        with patch(f"{_MODULE}tmux_manager") as mux:
+            mux.capabilities.native_worktrees = False
+            mux.capabilities.native_topic_targets = False
+            mux.create_window = AsyncMock(return_value=(True, "ok", "invoices", "@7"))
+            result = await _create_topic_window(
+                "/proj", "claude", None, context, window_name="invoices"
+            )
+
+        assert result == (True, "ok", "invoices", "@7")
+        mux.create_window.assert_awaited_once_with(
+            "/proj", window_name="invoices", launch_command="claude", workspace_id=None
         )
 
     async def test_guarded_target_failure_is_reported_not_raised(self) -> None:
@@ -340,6 +364,56 @@ class TestLaunchWindowSuccess:
         m.orchestration.clear_pending_creation.assert_called_once_with("@5")
         m.edit.assert_awaited_once()
         assert "✅" in m.edit.call_args[0][1]
+
+    async def test_window_is_named_after_the_topic_not_the_directory(
+        self, tmp_path
+    ) -> None:
+        """A topic created as "invoices" and rooted at ~/cc/daily gets window "invoices"."""
+        requested_topic_names.remember(-100999, 42, "invoices")
+        query = _make_query()
+        context = _make_context({PENDING_THREAD_ID: 42})
+
+        with _launch_env() as m:
+            m.mux.capabilities.native_topic_targets = False
+            m.mux.create_window = AsyncMock(return_value=(True, "ok", "invoices", "@5"))
+            await launch_window(query, context, _request(cwd=str(tmp_path)))
+
+        m.mux.create_window.assert_awaited_once_with(
+            str(tmp_path),
+            window_name="invoices",
+            launch_command="claude",
+            workspace_id=None,
+        )
+        m.router.bind_thread.assert_called_once_with(
+            100, 42, "@5", window_name="invoices", chat_id=-100999
+        )
+
+    async def test_without_a_requested_name_the_directory_name_is_kept(
+        self, tmp_path
+    ) -> None:
+        query = _make_query()
+        context = _make_context({PENDING_THREAD_ID: 42})
+
+        with _launch_env() as m:
+            m.mux.capabilities.native_topic_targets = False
+            m.mux.create_window = AsyncMock(return_value=(True, "ok", "proj", "@5"))
+            await launch_window(query, context, _request(cwd=str(tmp_path)))
+
+        m.mux.create_window.assert_awaited_once_with(
+            str(tmp_path), window_name=None, launch_command="claude", workspace_id=None
+        )
+
+    async def test_requested_name_is_forgotten_once_bound(self, tmp_path) -> None:
+        requested_topic_names.remember(-100999, 42, "invoices")
+        query = _make_query()
+        context = _make_context({PENDING_THREAD_ID: 42})
+
+        with _launch_env() as m:
+            m.mux.capabilities.native_topic_targets = False
+            m.mux.create_window = AsyncMock(return_value=(True, "ok", "invoices", "@5"))
+            await launch_window(query, context, _request(cwd=str(tmp_path)))
+
+        assert requested_topic_names.requested_name(-100999, 42) is None
 
     @patch(f"{_MODULE}_accept_yolo_confirmation", new_callable=AsyncMock)
     async def test_yolo_creation_guard_outlives_configured_confirmation(

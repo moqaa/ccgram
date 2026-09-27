@@ -24,6 +24,7 @@ from ...multiplexer import multiplexer as tmux_manager
 from ...multiplexer.base import canonical_window_id
 from ...utils import log_throttled
 from ...window_state_ports import legacy_state
+from . import requested_topic_names
 from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from ..callback_tokens import revoke_window_tokens
 from ..cleanup import clear_topic_state
@@ -537,6 +538,8 @@ async def topic_edited_handler(
 
     window_id = thread_router.get_window_for_chat_thread(chat_id, thread_id)
     if not window_id:
+        # Renamed before its window exists: the window will take this name.
+        requested_topic_names.remember(chat_id, thread_id, strip_emoji_prefix(new_name))
         logger.debug("Topic edited: no binding (thread=%d)", thread_id)
         return
 
