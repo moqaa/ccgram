@@ -40,7 +40,7 @@ from .topic_creation_draft import (
     PENDING_WORKTREE_PATH,
     PENDING_WORKTREE_REPO,
 )
-from . import topic_orchestration
+from . import requested_topic_names, topic_orchestration
 
 if TYPE_CHECKING:
     from telegram import CallbackQuery
@@ -138,6 +138,7 @@ async def _create_topic_window(
     launch_command: str | None,
     chosen_workspace_id: str | None,
     context: ContextTypes.DEFAULT_TYPE,
+    window_name: str | None = None,
 ) -> tuple[bool, str, str, str]:
     """Create the topic's window, returning ``(success, message, name, id)``.
 
@@ -145,6 +146,8 @@ async def _create_topic_window(
     intent, one ``worktree create`` makes the checkout + grouped workspace + the
     window in a single step. Gated on ``native_worktrees``; tmux always takes the
     ``create_window`` branch (its worktree was already created on disk earlier).
+    *window_name* (the topic's own name) replaces the directory-name default
+    on that branch.
     """
     ud = context.user_data
     wt_repo = ud.get(PENDING_WORKTREE_REPO) if ud else None
@@ -173,6 +176,7 @@ async def _create_topic_window(
     if tmux_manager.capabilities.native_topic_targets is not True:
         success, message, name, window_id = await tmux_manager.create_window(
             selected_path,
+            window_name=window_name,
             launch_command=launch_command,
             workspace_id=chosen_workspace_id,
         )
@@ -298,6 +302,14 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
 
     launch_command = resolve_launch_command(provider_name, approval_mode=approval_mode)
 
+    # Name the window after the topic ("invoices"), not the directory ("daily").
+    query_chat = query.message.chat if query.message else None
+    topic_name = (
+        requested_topic_names.requested_name(query_chat.id, pending_thread_id)
+        if query_chat is not None and pending_thread_id is not None
+        else None
+    )
+
     chosen_workspace_id: str | None = (
         context.user_data.get(PENDING_WORKSPACE_ID) if context.user_data else None
     ) or None
@@ -313,6 +325,7 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
             launch_command,
             chosen_workspace_id,
             context,
+            window_name=topic_name,
         )
         if success:
             if approval_mode == "yolo":
@@ -394,6 +407,8 @@ async def launch_window(  # noqa: PLR0912, PLR0915, C901
         )
         if chat and chat.type in ("group", "supergroup"):
             thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
+        if chat:
+            requested_topic_names.forget(chat.id, pending_thread_id)
 
     provider = provider_registry.get(provider_name)
     try:

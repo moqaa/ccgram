@@ -35,6 +35,7 @@ from ..topics.directory_browser import (
     clear_window_picker_state,
     clear_worktree_state,
 )
+from ..topics import requested_topic_names
 from ..topics.worktree import (
     slug_for_path,
     validate_branch_name,
@@ -273,6 +274,9 @@ async def _handle_unbound_topic(
     window_id = thread_router.get_window_for_thread(user_id, thread_id, message.chat.id)
     if window_id is not None:
         return False
+
+    # A new window created from here is named after the topic, not the directory.
+    requested_topic_names.remember_from_message(message)
 
     all_windows = await tmux_manager.list_windows()
     bound_ids = {bound_wid for _, _, bound_wid in thread_router.iter_thread_bindings()}
