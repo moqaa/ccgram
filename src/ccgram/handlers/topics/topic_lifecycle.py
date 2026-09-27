@@ -129,15 +129,13 @@ async def _close_expired_topic(
             return
 
     chat_id = scoped_chat_id or thread_router.resolve_chat_id(user_id, thread_id)
+    # Reaching here with state "dead" means the window is confirmed gone (or
+    # was never bound), so an opted-in delete cannot take a live window's topic.
     removed = False
-    try:
-        await client.close_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
-        removed = True
-    except TelegramError as e:
-        if is_thread_gone(e):
-            removed = True
-        else:
-            logger.debug("autoclose_failed", thread_id=thread_id, error=str(e))
+    if state == "dead" and config.delete_dead_topics:
+        removed = await _remove_topic(client, chat_id, thread_id, delete=True)
+    if not removed:
+        removed = await _remove_topic(client, chat_id, thread_id, delete=False)
     if removed:
         lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
         logger.info(
@@ -152,6 +150,22 @@ async def _close_expired_topic(
             thread_id,
             retirement_reason="remote_closed",
         )
+
+
+async def _remove_topic(
+    client: TelegramClient, chat_id: int, thread_id: int, *, delete: bool
+) -> bool:
+    """Delete or close a topic; True when it is gone or closed."""
+    remove = client.delete_forum_topic if delete else client.close_forum_topic
+    try:
+        await remove(chat_id=chat_id, message_thread_id=thread_id)
+    except TelegramError as e:
+        if is_thread_gone(e):
+            return True
+        event = "autodelete_failed" if delete else "autoclose_failed"
+        logger.debug(event, thread_id=thread_id, error=str(e))
+        return False
+    return True
 
 
 # ── Unbound window TTL ────────────────────────────────────────────────────

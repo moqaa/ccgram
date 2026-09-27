@@ -206,6 +206,23 @@ class TestSyncTopicNameFromWindow:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestDeleteDeadTopics:
+    def test_default_false(self, monkeypatch):
+        monkeypatch.delenv("CCGRAM_DELETE_DEAD_TOPICS", raising=False)
+        assert Config().delete_dead_topics is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "YES"])
+    def test_enabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_DELETE_DEAD_TOPICS", value)
+        assert Config().delete_dead_topics is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off"])
+    def test_disabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_DELETE_DEAD_TOPICS", value)
+        assert Config().delete_dead_topics is False
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestStatusMode:
     def test_default_is_system(self, monkeypatch):
         monkeypatch.delenv("CCGRAM_STATUS_MODE", raising=False)

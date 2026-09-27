@@ -116,6 +116,7 @@ class TestCheckAutocloseTimers:
         ):
             mock_config.autoclose_done_minutes = 30
             mock_config.autoclose_dead_minutes = 10
+            mock_config.delete_dead_topics = False  # opt-in; a MagicMock is truthy
             mock_router.get_window_for_thread.return_value = "@0"
             mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
             mock_tmux.list_windows_for_reconciliation = AsyncMock(
@@ -519,3 +520,92 @@ class TestAutocloseNeedsConfirmedDeath:
 
         client.close_forum_topic.assert_not_called()
         strategy.clear_autoclose_timer.assert_not_called()
+
+
+class TestDeleteDeadTopics:
+    """CCGRAM_DELETE_DEAD_TOPICS: a topic whose window is confirmed gone is deleted.
+
+    Closing leaves a locked topic behind for every window that ever died, and
+    /sync never cleans those (they retire as not cleanup-eligible). Opt-in only:
+    deletion is irreversible. Done topics and live windows are never deleted.
+    """
+
+    async def _expire(
+        self, state: str, *, delete_dead: bool, present: bool | None = False
+    ) -> tuple[AsyncMock, MagicMock]:
+        from ccgram.handlers.topics.topic_lifecycle import _close_expired_topic
+
+        client = AsyncMock()
+        with (
+            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
+            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.clear_topic_state",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "ccgram.multiplexer.reconciliation.window_presence",
+                new_callable=AsyncMock,
+                return_value=present,
+            ),
+        ):
+            mock_config.delete_dead_topics = delete_dead
+            mock_tr.iter_thread_bindings_with_chat.return_value = [
+                (100, -100200, 42, "@1")
+            ]
+            mock_tr.get_window_for_thread.return_value = "@1"
+            await _close_expired_topic(client, 100, 42, state)
+        return client, mock_tr
+
+    async def test_dead_window_topic_is_deleted_when_enabled(self) -> None:
+        client, router = await self._expire("dead", delete_dead=True)
+        client.delete_forum_topic.assert_awaited_once_with(
+            chat_id=-100200, message_thread_id=42
+        )
+        client.close_forum_topic.assert_not_called()
+        router.unbind_thread.assert_called_once()
+
+    async def test_dead_window_topic_is_only_closed_by_default(self) -> None:
+        client, _ = await self._expire("dead", delete_dead=False)
+        client.close_forum_topic.assert_awaited_once()
+        client.delete_forum_topic.assert_not_called()
+
+    async def test_done_topic_is_never_deleted(self) -> None:
+        client, _ = await self._expire("done", delete_dead=True)
+        client.close_forum_topic.assert_awaited_once()
+        client.delete_forum_topic.assert_not_called()
+
+    async def test_live_window_topic_is_never_deleted(self) -> None:
+        client, router = await self._expire("dead", delete_dead=True, present=True)
+        client.delete_forum_topic.assert_not_called()
+        client.close_forum_topic.assert_not_called()
+        router.unbind_thread.assert_not_called()
+
+    async def test_failed_delete_falls_back_to_close(self) -> None:
+        from ccgram.handlers.topics.topic_lifecycle import _close_expired_topic
+
+        client = AsyncMock()
+        client.delete_forum_topic.side_effect = BadRequest("Not enough rights")
+        with (
+            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
+            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.clear_topic_state",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "ccgram.multiplexer.reconciliation.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            mock_config.delete_dead_topics = True
+            mock_tr.iter_thread_bindings_with_chat.return_value = [
+                (100, -100200, 42, "@1")
+            ]
+            mock_tr.get_window_for_thread.return_value = "@1"
+            await _close_expired_topic(client, 100, 42, "dead")
+        client.close_forum_topic.assert_awaited_once_with(
+            chat_id=-100200, message_thread_id=42
+        )
+        mock_tr.unbind_thread.assert_called_once()

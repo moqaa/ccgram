@@ -250,6 +250,11 @@ class Config:
         self.sync_topic_name_from_window: bool = os.getenv(
             "CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW", "false"
         ).lower() in ("1", "true", "yes")
+        # Delete (not close) the topic of a window confirmed gone once the dead
+        # autoclose timer expires. Off by default: deletion is irreversible.
+        self.delete_dead_topics: bool = os.getenv(
+            "CCGRAM_DELETE_DEAD_TOPICS", "false"
+        ).lower() in ("1", "true", "yes")
         self._init_miniapp()
 
     def _init_miniapp(self) -> None:
