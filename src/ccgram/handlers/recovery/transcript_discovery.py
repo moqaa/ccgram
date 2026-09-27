@@ -65,6 +65,22 @@ def _is_agent_origin(
     return identity.provider_name not in ("", "shell") and initial_provider != "shell"
 
 
+async def _detect_provider(window_id: str, pane_current_command: str) -> str:
+    """Detect a pane's provider from its command, falling back to its title."""
+    detected = await detect_provider_from_pane(
+        pane_current_command, window_id=window_id
+    )
+    if not detected and should_probe_pane_title_for_provider_detection(
+        pane_current_command
+    ):
+        pane_title = await tmux_manager.get_pane_title(window_id)
+        detected = detect_provider_from_runtime(
+            pane_current_command,
+            pane_title=pane_title,
+        )
+    return detected
+
+
 async def _detect_and_apply_provider(
     window_id: str,
     identity: identity_state.IdentityProjection,
@@ -77,16 +93,16 @@ async def _detect_and_apply_provider(
     """Apply provider transitions; report when an agent-origin pane became a shell."""
     if identity_state.is_provider_manually_overridden(window_id):
         return False
-    detected = await detect_provider_from_pane(
-        w.pane_current_command, window_id=window_id
-    )
-    if not detected and should_probe_pane_title_for_provider_detection(
-        w.pane_current_command
-    ):
-        pane_title = await tmux_manager.get_pane_title(window_id)
-        detected = detect_provider_from_runtime(
-            w.pane_current_command,
-            pane_title=pane_title,
+    detected = await _detect_provider(window_id, w.pane_current_command)
+    if detected and detected != identity.provider_name:
+        # ``w`` comes from the poll cycle's single window listing, and a cycle
+        # awaits Telegram for every bound window, so it can be seconds old. A
+        # transition clears the window's session_map entry (or raises recovery),
+        # so confirm it against the live pane: an agent started since the
+        # listing still reads as its shell there.
+        live = await tmux_manager.find_window_by_id(window_id)
+        detected = (
+            await _detect_provider(window_id, live.pane_current_command) if live else ""
         )
 
     if detected == "shell" and _is_agent_origin(window_id, identity):
