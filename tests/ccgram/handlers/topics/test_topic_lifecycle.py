@@ -609,3 +609,134 @@ class TestDeleteDeadTopics:
             chat_id=-100200, message_thread_id=42
         )
         mock_tr.unbind_thread.assert_called_once()
+
+
+class TestAgentlessTopics:
+    """CCGRAM_AGENTLESS_TOPIC_MINUTES: a topic exists only while an agent runs.
+
+    A window that is still open but whose agent has exited (a bare shell) keeps
+    its topic forever otherwise: the dead timer clears itself when the window is
+    present. Agent liveness is the hook-maintained session_map entry.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_timers(self):
+        from ccgram.handlers.topics import topic_lifecycle
+
+        topic_lifecycle._agentless_since.clear()
+        yield
+        topic_lifecycle._agentless_since.clear()
+
+    async def _sweep(
+        self,
+        *,
+        minutes: int = 10,
+        agents: frozenset[str] | set[str] | None = frozenset(),
+        live: tuple[str, ...] = ("@1",),
+        elapsed: tuple[float, ...] = (0.0, 601.0),
+        client: AsyncMock | None = None,
+    ) -> tuple[AsyncMock, MagicMock, AsyncMock]:
+        """Run one sweep per entry in *elapsed* (seconds on the monotonic clock)."""
+        from ccgram.handlers.topics.topic_lifecycle import check_agentless_topics
+
+        client = client or AsyncMock()
+        windows = [WindowRef(window_id=w, window_name="w", cwd="/p") for w in live]
+        with (
+            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
+            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
+            patch("ccgram.handlers.topics.topic_lifecycle.time") as mock_time,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.clear_topic_state",
+                new_callable=AsyncMock,
+            ) as clear,
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle._agent_window_ids",
+                new_callable=AsyncMock,
+                return_value=None if agents is None else set(agents),
+            ),
+        ):
+            mock_config.agentless_topic_minutes = minutes
+            mock_tr.iter_thread_bindings_with_chat.return_value = [
+                (100, -100200, 42, "@1")
+            ]
+            for now in elapsed:
+                mock_time.monotonic.return_value = now
+                await check_agentless_topics(client, windows)
+        return client, mock_tr, clear
+
+    async def test_topic_of_agentless_window_is_deleted_after_the_grace(self) -> None:
+        client, router, clear = await self._sweep()
+        client.delete_forum_topic.assert_awaited_once_with(
+            chat_id=-100200, message_thread_id=42
+        )
+        router.unbind_thread.assert_called_once_with(
+            100, 42, chat_id=-100200, retirement_reason="remote_closed"
+        )
+        # The window is alive: window-dead cleanup must not run for it.
+        assert clear.await_args is not None
+        assert clear.await_args.kwargs["window_dead"] is False
+
+    async def test_nothing_is_deleted_within_the_grace(self) -> None:
+        client, router, _ = await self._sweep(elapsed=(0.0, 599.0))
+        client.delete_forum_topic.assert_not_called()
+        router.unbind_thread.assert_not_called()
+
+    async def test_first_sight_only_starts_the_clock(self) -> None:
+        client, _, _ = await self._sweep(elapsed=(99999.0,))
+        client.delete_forum_topic.assert_not_called()
+
+    async def test_window_running_an_agent_keeps_its_topic(self) -> None:
+        client, router, _ = await self._sweep(agents={"@1"})
+        client.delete_forum_topic.assert_not_called()
+        router.unbind_thread.assert_not_called()
+
+    async def test_agent_returning_resets_the_clock(self) -> None:
+        from ccgram.handlers.topics import topic_lifecycle
+
+        await self._sweep(elapsed=(0.0,))
+        assert topic_lifecycle._agentless_since
+        await self._sweep(agents={"@1"}, elapsed=(300.0,))
+        assert not topic_lifecycle._agentless_since
+        client, _, _ = await self._sweep(elapsed=(601.0,))
+        client.delete_forum_topic.assert_not_called()
+
+    async def test_missing_window_is_left_to_the_dead_path(self) -> None:
+        client, router, _ = await self._sweep(live=("@9",))
+        client.delete_forum_topic.assert_not_called()
+        router.unbind_thread.assert_not_called()
+
+    async def test_unreadable_session_map_defers(self) -> None:
+        client, router, _ = await self._sweep(agents=None)
+        client.delete_forum_topic.assert_not_called()
+        router.unbind_thread.assert_not_called()
+
+    async def test_off_by_default(self) -> None:
+        client, router, _ = await self._sweep(minutes=0)
+        client.delete_forum_topic.assert_not_called()
+        router.unbind_thread.assert_not_called()
+
+    async def test_refused_delete_falls_back_to_close(self) -> None:
+        client = AsyncMock()
+        client.delete_forum_topic.side_effect = BadRequest("Not enough rights")
+        client, router, _ = await self._sweep(client=client)
+        client.close_forum_topic.assert_awaited_once_with(
+            chat_id=-100200, message_thread_id=42
+        )
+        router.unbind_thread.assert_called_once()
+
+    async def test_agent_windows_come_from_the_session_map(self) -> None:
+        from ccgram.handlers.topics.topic_lifecycle import _agent_window_ids
+
+        raw = {"main:@1": {"session_id": "s", "cwd": "/p"}, "other:@7": {}}
+        with (
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.read_session_map_raw",
+                new_callable=AsyncMock,
+                return_value=raw,
+            ),
+            patch(
+                "ccgram.handlers.topics.topic_lifecycle.session_map_prefix",
+                return_value="main:",
+            ),
+        ):
+            assert await _agent_window_ids() == {"@1"}

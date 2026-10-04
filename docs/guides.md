@@ -452,6 +452,15 @@ ccgram --autoclose-done 0 --autoclose-dead 0
 
 Closed topics stay in the topic list, and `/sync` does not clean up topics retired this way. To **delete** a dead session's topic instead of closing it, set `CCGRAM_DELETE_DEAD_TOPICS=true` (off by default). It applies only when the dead timer expires and the window is confirmed gone. Done topics and topics of live windows are still only closed. If the delete is refused (for example, the bot lacks **Manage Topics**), the topic is closed as before. Deletion is irreversible and removes the topic's Telegram history; agent transcripts on disk are untouched.
 
+### Topics only while an agent runs
+
+By default every eligible window keeps a topic, including a window whose agent has exited and is back at a shell prompt: the dead timer clears itself because the window is still there, so the topic stays (and offers recovery buttons). Set `CCGRAM_AGENTLESS_TOPIC_MINUTES=10` to tie a topic to a running agent instead:
+
+- A live window with no hook-registered agent session for that many minutes has its topic **deleted** (closed if the delete is refused) and is unbound. The window itself is left alone.
+- Windows without an agent are no longer surfaced as topics. When an agent starts in one, its hook entry adopts the window and a new topic is created.
+
+Trade-offs: the topic's Telegram history goes each time the agent exits, an ended session can no longer be resumed from Telegram (resume it in the terminal), and Shell topics do not survive the grace period because a shell registers no session. Agent liveness is the `session_map.json` entry the hook maintains, so this needs a provider with hooks (Claude Code). `0` (the default) turns it off. The grace period restarts when ccgram restarts.
+
 ## Multi-Instance Setup
 
 Run multiple ccgram instances on the same machine, each owning a different Telegram group. All instances can share a single bot token. Because Telegram rate limits are token-wide, divide the expected aggregate traffic across instances; these processes do not share a rate-limit coordinator.

@@ -17,7 +17,11 @@ from telegram.error import BadRequest, RetryAfter, TelegramError
 from ... import window_query
 from ...config import config
 from ...session import session_manager
-from ...session_map import session_map_prefix
+from ...session_map import (
+    parse_session_map,
+    read_session_map_raw,
+    session_map_prefix,
+)
 from ...telegram_client import PTBTelegramClient, TelegramClient
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
@@ -167,6 +171,87 @@ async def _remove_topic(
         logger.debug(event, thread_id=thread_id, error=str(e))
         return False
     return True
+
+
+# ── Agentless topics ─────────────────────────────────────────────────────
+
+# (user_id, thread_id) -> monotonic time the bound window was first seen
+# without an agent. In memory only: a restart restarts the grace period.
+_agentless_since: dict[tuple[int, int], float] = {}
+
+
+async def _agent_window_ids() -> set[str] | None:
+    """Windows with a hook-registered agent session; None when unreadable."""
+    raw = await read_session_map_raw()
+    if raw is None:
+        return None
+    return {
+        canonical_window_id(wid) for wid in parse_session_map(raw, session_map_prefix())
+    }
+
+
+async def check_agentless_topics(
+    client: TelegramClient, all_windows: "list[TmuxWindow]"
+) -> None:
+    """Delete the topic of a live window whose agent has been gone too long.
+
+    The dead autoclose never fires for such a window: its timer clears itself
+    because the window is present. The session_map entry the agent hook keeps
+    is the liveness signal; pane commands are not (Claude reports a version
+    string). A window missing from the listing is left to the dead path, and
+    an unreadable session_map defers the whole sweep.
+    """
+    grace = config.agentless_topic_minutes * 60
+    if grace <= 0:
+        return
+    agents = await _agent_window_ids()
+    if agents is None:
+        return
+    live = {canonical_window_id(w.window_id) for w in all_windows}
+    now = time.monotonic()
+    bound: set[tuple[int, int]] = set()
+    expired: list[tuple[int, int | None, int, str]] = []
+    for user_id, chat_id, thread_id, window_id in list(
+        thread_router.iter_thread_bindings_with_chat()
+    ):
+        key = (user_id, thread_id)
+        bound.add(key)
+        wid = canonical_window_id(window_id)
+        if wid not in live or wid in agents:
+            _agentless_since.pop(key, None)
+            continue
+        since = _agentless_since.setdefault(key, now)
+        if now - since >= grace:
+            expired.append((user_id, chat_id, thread_id, window_id))
+    for key in set(_agentless_since) - bound:
+        del _agentless_since[key]
+
+    for user_id, scoped_chat_id, thread_id, window_id in expired:
+        chat_id = scoped_chat_id or thread_router.resolve_chat_id(user_id, thread_id)
+        removed = await _remove_topic(client, chat_id, thread_id, delete=True)
+        if not removed:
+            removed = await _remove_topic(client, chat_id, thread_id, delete=False)
+        if not removed:
+            continue
+        _agentless_since.pop((user_id, thread_id), None)
+        logger.info(
+            "agentless_topic_removed",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            window_id=window_id,
+        )
+        await clear_topic_state(
+            user_id,
+            thread_id,
+            client=client,
+            window_id=window_id,
+            chat_id=chat_id,
+            window_dead=False,
+        )
+        thread_router.unbind_thread(
+            user_id, thread_id, chat_id=chat_id, retirement_reason="remote_closed"
+        )
 
 
 # ── Unbound window TTL ────────────────────────────────────────────────────

@@ -223,6 +223,17 @@ class TestDeleteDeadTopics:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestAgentlessTopicMinutes:
+    def test_default_is_off(self, monkeypatch):
+        monkeypatch.delenv("CCGRAM_AGENTLESS_TOPIC_MINUTES", raising=False)
+        assert Config().agentless_topic_minutes == 0
+
+    def test_reads_minutes(self, monkeypatch):
+        monkeypatch.setenv("CCGRAM_AGENTLESS_TOPIC_MINUTES", "10")
+        assert Config().agentless_topic_minutes == 10
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestStatusMode:
     def test_default_is_system(self, monkeypatch):
         monkeypatch.delenv("CCGRAM_STATUS_MODE", raising=False)
