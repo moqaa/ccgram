@@ -818,6 +818,25 @@ class TestEmitUnboundWindowEvents:
         surfaced = {c.args[0].window_id for c in cb.call_args_list}
         assert surfaced == {"@1", "@2"}
 
+    async def test_agentless_windows_get_no_topic_when_topics_require_an_agent(
+        self, monitor: SessionMonitor, wired, monkeypatch
+    ) -> None:
+        """CCGRAM_AGENTLESS_TOPIC_MINUTES: a window the hook never registered is a
+        bare shell. Surfacing it would recreate the topic the agentless sweep
+        just deleted; the session_map path adopts it once an agent starts."""
+        cb = AsyncMock(spec=lambda event: None)
+        monitor.set_new_window_callback(cb)
+        monkeypatch.setattr(
+            "ccgram.session_monitor.tmux_manager",
+            SimpleNamespace(capabilities=_TMUX_CAPS),
+        )
+        monkeypatch.setattr("ccgram.session_monitor.config.agentless_topic_minutes", 10)
+
+        windows = [_winref("@1", "zsh"), _winref("@2", "claude")]
+        await monitor._emit_unbound_window_events(windows, known_window_ids=set())
+
+        cb.assert_not_called()
+
     async def test_herdr_surfaces_only_agent_sessions(
         self, monitor: SessionMonitor, wired, monkeypatch
     ) -> None:

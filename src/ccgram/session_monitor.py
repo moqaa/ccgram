@@ -738,6 +738,12 @@ class SessionMonitor:
         """
         if not self._new_window_callback:
             return
+        if config.agentless_topic_minutes > 0:
+            # Topics require an agent: a window the hook never registered is a
+            # bare shell. The session_map path adopts it once an agent starts;
+            # surfacing it here would recreate the topic the agentless sweep
+            # just deleted.
+            return
         # Lazy: thread_router is wired into session_manager which imports
         # session_monitor; hoisting forms a startup cycle.
         from .thread_router import thread_router

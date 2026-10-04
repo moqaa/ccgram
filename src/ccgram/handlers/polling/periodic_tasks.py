@@ -18,6 +18,7 @@ from ...telegram_client import TelegramClient
 from ...utils import log_throttle_sweep
 from ..live.live_view import tick_live_views
 from ..topics.topic_lifecycle import (
+    check_agentless_topics,
     check_autoclose_timers,
     check_unbound_window_ttl,
     probe_topic_existence,
@@ -70,4 +71,5 @@ async def run_lifecycle_tasks(
 ) -> None:
     """Run per-tick lifecycle tasks (autoclose timers, unbound window TTL)."""
     await check_autoclose_timers(client)
+    await check_agentless_topics(client, all_windows)
     await check_unbound_window_ttl(all_windows)

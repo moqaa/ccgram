@@ -255,6 +255,13 @@ class Config:
         self.delete_dead_topics: bool = os.getenv(
             "CCGRAM_DELETE_DEAD_TOPICS", "false"
         ).lower() in ("1", "true", "yes")
+        # A topic exists only while an agent runs in its window: after this many
+        # minutes with no hook-registered session, a live window's topic is
+        # deleted, and agentless windows are no longer surfaced as topics.
+        # 0 = off (the default): every eligible window keeps a topic.
+        self.agentless_topic_minutes: int = int(
+            os.getenv("CCGRAM_AGENTLESS_TOPIC_MINUTES", "0")
+        )
         self._init_miniapp()
 
     def _init_miniapp(self) -> None:
