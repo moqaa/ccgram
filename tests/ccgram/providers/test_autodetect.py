@@ -55,6 +55,24 @@ class TestDetectProviderFromPane:
         assert result == ""
         mock_mux.foreground.assert_not_called()
 
+    async def test_version_titled_process_routes_through_foreground(self) -> None:
+        """Claude Code retitles its process to its version (``2.1.306``), so the
+        pane command is a version string. That is inconclusive, not "no agent":
+        the foreground argv still says ``claude``."""
+        mock_mux = MagicMock()
+        mock_mux.foreground = AsyncMock(
+            return_value=ForegroundInfo(
+                pid=23106,
+                pgid=23106,
+                argv=["claude", "--dangerously-skip-permissions", "--resume", "x"],
+                cwd="/tmp",
+            )
+        )
+        with patch("ccgram.multiplexer.multiplexer", mock_mux):
+            result = await detect_provider_from_pane("2.1.306", window_id="@14")
+        assert result == "claude"
+        mock_mux.foreground.assert_awaited_once_with("@14")
+
     async def test_missing_window_id_returns_empty(self) -> None:
         mock_mux = MagicMock()
         mock_mux.foreground = AsyncMock()
