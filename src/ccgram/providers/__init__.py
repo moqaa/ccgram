@@ -211,6 +211,9 @@ def detect_provider_from_command(pane_current_command: str) -> str:
     return ""
 
 
+# A process that retitled itself to a bare version number (Claude Code does).
+_VERSION_TITLE_RE = re.compile(r"^\d+(\.\d+)+$")
+
 _CLAUDE_PROJECTS_RE = re.compile(r"/\.claude[a-z0-9._-]*/projects/")
 
 
@@ -311,8 +314,10 @@ async def detect_provider_from_pane(
     basename = os.path.basename(cmd.split()[0]) if cmd else ""
     # A non-empty, non-runtime command already failed the fast path and won't
     # be clarified by the foreground process, so stop here. Empty commands fall
-    # through (herdr bare shell) so the foreground argv can classify them.
-    if cmd and basename not in JS_RUNTIMES:
+    # through (herdr bare shell) so the foreground argv can classify them, and
+    # so do version strings: Claude Code retitles its process to its version
+    # (``2.1.306``), which tmux reports as the pane command.
+    if cmd and basename not in JS_RUNTIMES and not _VERSION_TITLE_RE.match(basename):
         return ""
 
     # Lazy: process_detection pulls the providers internals; only worth
