@@ -1,12 +1,15 @@
 import ast
+import asyncio
 import inspect
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from telegram import Bot
 from telegram.error import TelegramError
 
+from ccgram.event_stream_monitor import EventStreamMonitor
+from ccgram.multiplexer.base import MuxEvent
 from ccgram.handlers.polling import window_tick
 from ccgram.handlers.polling.polling_state import (
     interactive_strategy,
@@ -15,6 +18,7 @@ from ccgram.handlers.polling.polling_state import (
     terminal_screen_buffer,
 )
 from ccgram.handlers.polling.window_tick import (
+    _apply_done_transition,
     _forward_pane_output,
     _handle_dead_window_notification,
     _maybe_check_passive_shell,
@@ -26,20 +30,23 @@ from ccgram.handlers.polling.window_tick import (
 from ccgram.handlers.polling.polling_types import PaneTransition
 from ccgram.handlers.polling.window_tick.apply import _PANE_OUTPUT_PREVIEW_LINES
 from ccgram.providers.base import StatusUpdate
+from ccgram.handlers.topics.topic_orchestration import (
+    clear_pending_creation,
+    register_pending_creation,
+)
+from ccgram.thread_router import ThreadRouter
 from ccgram.window_state_store import window_store
 
 
 @pytest.fixture(autouse=True)
 def _reset():
     terminal_poll_state._states.clear()  # no public clear_all method
-    lifecycle_strategy.reset_autoclose_state()
     lifecycle_strategy.reset_typing_state()
     lifecycle_strategy.reset_dead_notification_state()
     interactive_strategy.clear_all_alerts()
     terminal_screen_buffer.reset_screen_buffer_state()
     yield
     terminal_poll_state._states.clear()
-    lifecycle_strategy.reset_autoclose_state()
     lifecycle_strategy.reset_typing_state()
     lifecycle_strategy.reset_dead_notification_state()
     interactive_strategy.clear_all_alerts()
@@ -69,7 +76,7 @@ class TestTickWindowDeadWindow:
         with patch.object(
             window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
         ) as mock_dead:
-            await tick_window(bot, 1, 100, "@0", None)
+            await tick_window(bot, 1, 100, "@0", None, MagicMock())
             mock_dead.assert_called_once()
             args, kwargs = mock_dead.call_args
             assert args == (bot, 1, 100, "@0")
@@ -87,7 +94,7 @@ class TestTickWindowDeadWindow:
                 window_tick, "_scan_window_panes", new_callable=AsyncMock
             ) as mock_scan,
         ):
-            await tick_window(bot, 1, 100, "@0", None)
+            await tick_window(bot, 1, 100, "@0", None, MagicMock())
             mock_status.assert_not_called()
             mock_scan.assert_not_called()
 
@@ -97,29 +104,26 @@ class TestTickWindowDeadWindow:
         with patch.object(
             window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
         ) as mock_dead:
-            await tick_window(bot, 1, 100, "@0", None)
+            await tick_window(bot, 1, 100, "@0", None, MagicMock())
             mock_dead.assert_not_called()
 
     async def test_agent_exit_kills_managed_window_and_enters_recovery(self):
         bot = AsyncMock(spec=Bot)
         window = _make_window()
+        adapter = MagicMock()
+        adapter.close = AsyncMock(return_value=(True, "closed"))
         with (
             patch.object(
                 window_tick,
                 "discover_and_register_transcript",
                 new_callable=AsyncMock,
                 return_value=True,
-            ),
+            ) as mock_discover,
             patch.object(
                 window_tick.lifecycle_state,
                 "get_origin",
                 return_value="ccgram_created",
             ),
-            patch.object(
-                window_tick,
-                "tmux_manager",
-                MagicMock(kill_window=AsyncMock()),
-            ) as mock_tmux,
             patch.object(
                 window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
             ) as mock_dead,
@@ -127,9 +131,10 @@ class TestTickWindowDeadWindow:
                 window_tick, "_update_status", new_callable=AsyncMock
             ) as mock_status,
         ):
-            await tick_window(bot, 1, 100, "@0", window)
+            await tick_window(bot, 1, 100, "@0", window, adapter)
 
-        mock_tmux.kill_window.assert_awaited_once_with("@0")
+        adapter.close.assert_awaited_once_with("@0")
+        assert mock_discover.call_args.kwargs["adapter"] is adapter
         mock_dead.assert_awaited_once_with(
             bot, 1, 100, "@0", runtime=window_tick.get_default_runtime()
         )
@@ -138,6 +143,8 @@ class TestTickWindowDeadWindow:
     async def test_agent_exit_keeps_manually_discovered_window(self):
         bot = AsyncMock(spec=Bot)
         window = _make_window()
+        adapter = MagicMock()
+        adapter.close = AsyncMock(return_value=(True, "closed"))
         with (
             patch.object(
                 window_tick,
@@ -151,17 +158,12 @@ class TestTickWindowDeadWindow:
                 return_value="manual_discovered",
             ),
             patch.object(
-                window_tick,
-                "tmux_manager",
-                MagicMock(kill_window=AsyncMock()),
-            ) as mock_tmux,
-            patch.object(
                 window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
             ) as mock_dead,
         ):
-            await tick_window(bot, 1, 100, "@0", window)
+            await tick_window(bot, 1, 100, "@0", window, adapter)
 
-        mock_tmux.kill_window.assert_not_awaited()
+        adapter.close.assert_not_awaited()
         mock_dead.assert_awaited_once()
 
 
@@ -190,7 +192,7 @@ class TestTickWindowPendingQueue:
                 window_tick, "_maybe_check_passive_shell", new_callable=AsyncMock
             ) as mock_shell,
         ):
-            await tick_window(bot, 1, 100, "@0", w)
+            await tick_window(bot, 1, 100, "@0", w, MagicMock())
             mock_interactive.assert_called_once()
             mock_status.assert_not_called()
             mock_scan.assert_called_once()
@@ -219,7 +221,7 @@ class TestTickWindowEmptyQueue:
                 window_tick, "_maybe_check_passive_shell", new_callable=AsyncMock
             ) as mock_shell,
         ):
-            await tick_window(bot, 1, 100, "@0", w)
+            await tick_window(bot, 1, 100, "@0", w, MagicMock())
             mock_status.assert_called_once()
             mock_scan.assert_called_once()
             mock_shell.assert_called_once()
@@ -241,7 +243,7 @@ class TestTickWindowEmptyQueue:
                 window_tick, "_maybe_check_passive_shell", new_callable=AsyncMock
             ),
         ):
-            await tick_window(bot, 1, 100, "@0", w)
+            await tick_window(bot, 1, 100, "@0", w, MagicMock())
             mock_status.assert_called_once()
 
 
@@ -496,51 +498,403 @@ class TestContractTests:
 
 
 class TestDeadWindowTopicDeleted:
-    @pytest.mark.parametrize(
-        "error_msg",
-        ["thread not found", "TOPIC_ID_INVALID"],
-        ids=["thread_not_found", "topic_id_invalid"],
-    )
-    async def test_thread_not_found_unbinds_and_clears(self, error_msg):
-        from telegram.error import BadRequest
-
-        bot = AsyncMock(spec=["unpin_all_forum_topic_messages"])
-        bot.unpin_all_forum_topic_messages = AsyncMock(
-            side_effect=BadRequest(error_msg)
+    async def test_done_binding_is_deleted_when_terminal_later_dies(self):
+        bot = AsyncMock(spec=Bot)
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
         )
+        router.bind_thread(1, 100, "@0", chat_id=42)
 
         with (
-            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
-            patch("ccgram.handlers.polling.window_tick.apply.window_query") as mock_sm,
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
             patch(
                 "ccgram.handlers.polling.window_tick.apply.update_topic_emoji",
                 new_callable=AsyncMock,
             ),
             patch(
-                "ccgram.handlers.polling.window_tick.apply.clear_tool_msg_ids_for_topic"
-            ),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply.rate_limit_send_message",
+                "ccgram.handlers.polling.window_tick.apply.enqueue_status_update",
                 new_callable=AsyncMock,
-                return_value=None,
+            ),
+        ):
+            await _apply_done_transition(bot, 1, "@0", 100)
+
+        assert router.get_window_for_thread(1, 100, 42) == "@0"
+        bot.close_forum_topic.assert_not_awaited()
+        bot.delete_forum_topic.assert_not_awaited()
+
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
                 new_callable=AsyncMock,
-            ) as mock_clear,
+            ),
+            patch("ccgram.handlers.topics.topic_deletion.session_manager"),
         ):
-            mock_tr.resolve_chat_id.return_value = 42
-            mock_tr.get_display_name.return_value = "test"
-            mock_sm.get_window_state.return_value = MagicMock(cwd="/tmp")
-
             await _handle_dead_window_notification(bot, 1, 100, "@0")
 
-            mock_clear.assert_awaited_once()
-            _, kwargs = mock_clear.call_args
-            assert kwargs.get("window_dead") is True
-            mock_tr.unbind_thread.assert_called_once_with(
-                1, 100, retirement_reason="remote_deleted"
+        bot.delete_forum_topic.assert_awaited_once()
+        assert router.get_window_for_thread(1, 100, 42) is None
+
+    @pytest.mark.parametrize("window_id", ["@0", "herdr-session-v1-" + "a" * 64])
+    async def test_confirmed_disappearance_deletes_without_recovery(self, window_id):
+        bot = AsyncMock(spec=Bot)
+
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, window_id, chat_id=42)
+
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as presence,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_tool_msg_ids_for_topic"
+            ) as clear_tool,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
+                new_callable=AsyncMock,
+            ) as clear_state,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.update_topic_emoji",
+                new_callable=AsyncMock,
+            ) as update_emoji,
+            patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+        ):
+            await _handle_dead_window_notification(bot, 1, 100, window_id)
+
+        presence.assert_awaited_once_with(window_id, ANY)
+        clear_tool.assert_called_once_with(1, 100)
+        bot.delete_forum_topic.assert_awaited_once()
+        clear_state.assert_awaited_once_with(
+            1,
+            100,
+            ANY,
+            window_id=window_id,
+            chat_id=42,
+            window_dead=True,
+        )
+        update_emoji.assert_not_awaited()
+        bot.unpin_all_forum_topic_messages.assert_not_awaited()
+
+    @pytest.mark.parametrize("autodelete", [False, True], ids=["off", "on"])
+    async def test_autodelete_knob_gates_dead_topic_deletion(self, autodelete):
+        bot = AsyncMock(spec=Bot)
+
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_tool_msg_ids_for_topic"
+            ),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                window_tick.apply,
+                "config",
+                MagicMock(autodelete_dead_topics=autodelete),
+            ),
+            patch("ccgram.handlers.polling.window_tick.apply.logger") as mock_logger,
+            patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+        ):
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+
+        if autodelete:
+            bot.delete_forum_topic.assert_awaited_once()
+            assert router.get_window_for_chat_thread(42, 100) is None
+            # The autodelete path retires and clears the sticky marker.
+            assert (1, 100, "@0") not in lifecycle_strategy._dead_notified
+        else:
+            # The topic stays and so does its binding: a later
+            # reconciliation can still fold it onto a re-keyed digest.
+            bot.delete_forum_topic.assert_not_awaited()
+            assert router.get_window_for_chat_thread(42, 100) == "@0"
+            # The retained path stamps a log entry and keeps the dead
+            # marker sticky so the poll loop doesn't re-probe every tick.
+            mock_logger.info.assert_called_once_with(
+                "dead_session_topic_retained",
+                user_id=1,
+                thread_id=100,
+                window_id="@0",
             )
+            assert (1, 100, "@0") in lifecycle_strategy._dead_notified
+
+    async def test_autodelete_on_stamps_dead_session_reason(self):
+        """Even with the knob on, a failed delete leaves a pending retired
+        record — the exact record the knob-off sweep filters out by reason."""
+        bot = AsyncMock(spec=Bot)
+        bot.delete_forum_topic.side_effect = TelegramError("no rights")
+
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_tool_msg_ids_for_topic"
+            ),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
+                new_callable=AsyncMock,
+            ),
+            patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+        ):
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+
+        retired = next(router.iter_retired_topics())
+        assert retired.reason == "dead_session"
+
+    @pytest.mark.parametrize("presence_value", [True, None], ids=["present", "unknown"])
+    async def test_unconfirmed_presence_clears_marker_without_deletion(
+        self, presence_value
+    ):
+        bot = AsyncMock(spec=Bot)
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=presence_value,
+            ) as presence,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.retire_topic_binding",
+                new_callable=AsyncMock,
+            ) as retire_binding,
+        ):
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+
+        presence.assert_awaited_once_with("@0", ANY)
+        retire_binding.assert_not_awaited()
+        assert (1, 100, "@0") not in lifecycle_strategy._dead_notified
+
+    @pytest.mark.parametrize("begin_during_probe", [False, True])
+    async def test_pending_creation_defers_dead_topic_deletion(
+        self, begin_during_probe
+    ):
+        bot = AsyncMock(spec=Bot)
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+        staged = False
+
+        async def probe(*_args):
+            nonlocal staged
+            if begin_during_probe and not staged:
+                register_pending_creation("@0", ttl_s=300)
+                staged = True
+            return False
+
+        if not begin_during_probe:
+            register_pending_creation("@0", ttl_s=300)
+        try:
+            with (
+                patch(
+                    "ccgram.handlers.polling.window_tick.apply.thread_router", router
+                ),
+                patch(
+                    "ccgram.handlers.polling.window_tick.apply.window_presence",
+                    side_effect=probe,
+                ),
+                patch(
+                    "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
+                    new_callable=AsyncMock,
+                ),
+                patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+            ):
+                await _handle_dead_window_notification(bot, 1, 100, "@0")
+                bot.delete_forum_topic.assert_not_awaited()
+                assert router.get_window_for_chat_thread(42, 100) == "@0"
+                assert (1, 100, "@0") not in lifecycle_strategy._dead_notified
+                clear_pending_creation("@0")
+                await _handle_dead_window_notification(bot, 1, 100, "@0")
+                bot.delete_forum_topic.assert_awaited_once()
+                assert router.get_window_for_chat_thread(42, 100) is None
+        finally:
+            clear_pending_creation("@0")
+
+    async def test_unknown_then_confirmed_dead_retries_deletion(self):
+        bot = AsyncMock(spec=Bot)
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                side_effect=[None, False],
+            ) as presence,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
+                new_callable=AsyncMock,
+            ),
+            patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+        ):
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+
+        assert presence.await_count == 2
+        bot.delete_forum_topic.assert_awaited_once()
+        assert (1, 100, "@0") not in lifecycle_strategy._dead_notified
+
+    async def test_confirmed_disappearance_without_chat_identity_is_protected(self):
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router") as mock_tr,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.retire_topic_binding",
+                new_callable=AsyncMock,
+            ) as retire_binding,
+        ):
+            mock_tr.iter_thread_bindings_with_chat.return_value = [(1, None, 100, "@0")]
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+
+        retire_binding.assert_not_awaited()
+
+    async def test_confirmed_disappearance_is_deduplicated(self):
+        bot = AsyncMock(spec=Bot)
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as presence,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.clear_topic_state",
+                new_callable=AsyncMock,
+            ),
+            patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+        ):
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+
+        presence.assert_awaited_once()
+        bot.delete_forum_topic.assert_awaited_once()
+
+    async def test_concurrent_push_and_poll_share_death_guard(self):
+        bot = AsyncMock(spec=Bot)
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+        probing = asyncio.Event()
+        release = asyncio.Event()
+
+        async def presence(*_args):
+            probing.set()
+            await release.wait()
+            return False
+
+        async def on_window_died(wid):
+            await _handle_dead_window_notification(bot, 1, 100, wid)
+
+        monitor = EventStreamMonitor(lambda: {"@0"}, on_window_died=on_window_died)
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                side_effect=presence,
+            ),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.retire_topic_binding",
+                new_callable=AsyncMock,
+                return_value="deleted",
+            ) as retire_binding,
+        ):
+            push = asyncio.create_task(monitor._dispatch(MuxEvent("window_died", "@0")))
+            try:
+                await asyncio.wait_for(probing.wait(), timeout=1)
+                await _handle_dead_window_notification(bot, 1, 100, "@0")
+            finally:
+                release.set()
+                await push
+
+        retire_binding.assert_awaited_once()
+        assert retire_binding.await_args is not None
+        assert retire_binding.await_args.kwargs["chat_id"] == 42
+
+    async def test_same_window_in_two_chats_deletes_each_binding(self):
+        bot = AsyncMock(spec=Bot)
+        router = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _window_id: False,
+        )
+        router.bind_thread(1, 100, "@0", chat_id=42)
+        router.bind_thread(1, 100, "@0", chat_id=43)
+
+        with (
+            patch("ccgram.handlers.polling.window_tick.apply.thread_router", router),
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.window_presence",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as presence,
+            patch(
+                "ccgram.handlers.polling.window_tick.apply.retire_topic_binding",
+                new_callable=AsyncMock,
+                side_effect=["deleted", "deleted"],
+            ) as retire_binding,
+            patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+        ):
+            await _handle_dead_window_notification(bot, 1, 100, "@0")
+
+        presence.assert_awaited_once()
+        assert [call.kwargs["chat_id"] for call in retire_binding.await_args_list] == [
+            42,
+            43,
+        ]
 
 
 class TestPaneLifecycleNotify:

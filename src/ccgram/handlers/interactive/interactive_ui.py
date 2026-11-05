@@ -15,10 +15,14 @@ State dicts are keyed by ``(user_id, chat_id, thread_id_or_0)``. This keeps
 identical topic IDs in separate chats from sharing interactive callbacks.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
+import hashlib
 import re
 import time
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -26,7 +30,16 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from ...providers import get_provider_for_window
+from ...providers.pi import PI_QUESTION_FOOTER
+from .pi_controls import (
+    MENU_INSTRUCTION,
+    MENU_BUTTON_INSTRUCTION,
+    build_menu_keyboard,
+)
 from ...telegram_client import TelegramClient
+
+if TYPE_CHECKING:
+    from ...providers.base import TerminalMenu
 from ...window_query import get_window_provider
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
@@ -69,6 +82,11 @@ _interactive_msgs: dict[InteractiveKey, int] = {}
 
 # Track interactive mode: (user_id, chat_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[InteractiveKey, str] = {}
+# Which pane owns the shown prompt (None = active-pane/window-level).
+# A window-level Escape lands on the ACTIVE pane, which in a
+# multi-pane window can be a different agent than the one showing
+# the prompt, so dismissal must target the owning pane when known.
+_interactive_panes: dict[InteractiveKey, str | None] = {}
 
 # The chat/message that owns the currently rendered keyboard. Direct choices
 # are accepted only from this exact Telegram prompt, not a copied callback.
@@ -78,6 +96,8 @@ _interactive_contexts: dict[InteractiveKey, tuple[int, int]] = {}
 # a direct choice is used. This invalidates delayed or double-tapped choices.
 _interactive_sequences: dict[InteractiveKey, int] = {}
 _interactive_contents: dict[InteractiveKey, str] = {}
+_interactive_prompt_fingerprints: dict[InteractiveKey, str | None] = {}
+_interactive_menus: dict[InteractiveKey, TerminalMenu] = {}
 
 # Cooldown to prevent flood when interactive sends fail repeatedly
 _send_cooldowns: dict[InteractiveKey, float] = {}
@@ -125,6 +145,8 @@ def format_interactive_message(
     text: str,
     pane_id: str | None = None,
     pane_name: str | None = None,
+    *,
+    instruction_line: str = INTERACTIVE_INSTRUCTION_LINE,
 ) -> str:
     """Build the body of an interactive UI message.
 
@@ -137,7 +159,7 @@ def format_interactive_message(
     (most recent lines win) when the combined message would exceed
     Telegram's 4096-char per-message limit.
     """
-    header = INTERACTIVE_INSTRUCTION_LINE
+    header = instruction_line
     if pane_id:
         label = pane_name.strip() if pane_name and pane_name.strip() else "Pane"
         header = f"{header}\n\U0001f500 {label} ({pane_id}):"
@@ -170,14 +192,46 @@ def get_interactive_window(
     return _interactive_mode.get(_interactive_key(user_id, thread_id, chat_id))
 
 
+def get_interactive_pane(
+    user_id: int,
+    thread_id: int | None = None,
+    chat_id: int | None = None,
+) -> str | None:
+    """The pane owning the current interactive prompt, when pane-scoped."""
+    return _interactive_panes.get(_interactive_key(user_id, thread_id, chat_id))
+
+
+def _record_interactive_pane(ikey: InteractiveKey, pane_id: str | None) -> None:
+    """Remember the pane owning the topic's live prompt.
+
+    A window-level detection (``None``) means the active pane, which is
+    also where forwarded text lands, so it must not be replaced by a
+    sibling pane's prompt: dismissal would then target the sibling while
+    the text reaches the still-interactive active pane. A later
+    window-level detection does replace a sibling owner.
+    """
+    if (
+        pane_id is None
+        or ikey not in _interactive_panes
+        or _interactive_panes[ikey] is not None
+    ):
+        _interactive_panes[ikey] = pane_id
+
+
 def set_interactive_mode(
     user_id: int,
     window_id: str,
     thread_id: int | None = None,
     *,
     chat_id: int | None = None,
+    pane_id: str | None = None,
 ) -> None:
-    """Set interactive mode for a user's chat/topic."""
+    """Set interactive mode for a user's chat/topic.
+
+    ``pane_id`` records which pane owns the prompt (None for the
+    active-pane/window-level prompt), so a later dismissal can target
+    the owning pane instead of whichever pane happens to be active.
+    """
     logger.debug(
         "Set interactive mode: user=%d, window_id=%s, thread=%s, chat=%s",
         user_id,
@@ -185,7 +239,9 @@ def set_interactive_mode(
         thread_id,
         chat_id,
     )
-    _interactive_mode[_interactive_key(user_id, thread_id, chat_id)] = window_id
+    ikey = _interactive_key(user_id, thread_id, chat_id)
+    _interactive_mode[ikey] = window_id
+    _record_interactive_pane(ikey, pane_id)
 
 
 def clear_interactive_mode(
@@ -203,9 +259,12 @@ def clear_interactive_mode(
     )
     ikey = _interactive_key(user_id, thread_id, chat_id)
     _interactive_mode.pop(ikey, None)
+    _interactive_panes.pop(ikey, None)
     _interactive_contexts.pop(ikey, None)
     _interactive_sequences.pop(ikey, None)
     _interactive_contents.pop(ikey, None)
+    _interactive_prompt_fingerprints.pop(ikey, None)
+    _interactive_menus.pop(ikey, None)
 
 
 def get_interactive_msg_id(
@@ -220,6 +279,8 @@ def get_interactive_msg_id(
 
 def _numbered_menu_blocks(
     lines: list[str],
+    *,
+    allow_descriptions: bool = False,
 ) -> list[tuple[int, int, tuple[tuple[str, str], ...]]]:
     """Find contiguous sequential numbered menu blocks and their line ranges."""
     blocks: list[tuple[int, int, tuple[tuple[str, str], ...]]] = []
@@ -234,6 +295,14 @@ def _numbered_menu_blocks(
         choices: list[tuple[str, str]] = []
         expected = 1
         while index < len(lines):
+            # Pi indents descriptions past the option number, including numbered prose.
+            if (
+                allow_descriptions
+                and lines[index].strip()
+                and lines[index].startswith(" " * (first.start(1) + 1))
+            ):
+                index += 1
+                continue
             option = _NUMBERED_OPTION_RE.fullmatch(lines[index])
             if option is None:
                 break
@@ -264,7 +333,10 @@ def parse_direct_choices(content: str) -> tuple[tuple[str, str], ...]:
         return ()
 
     lines = content.splitlines()
-    blocks = _numbered_menu_blocks(lines)
+    blocks = _numbered_menu_blocks(
+        lines,
+        allow_descriptions=any(line.strip() == PI_QUESTION_FOOTER for line in lines),
+    )
     anchors = [
         index
         for index, line in enumerate(lines)
@@ -299,12 +371,54 @@ def parse_direct_choices(content: str) -> tuple[tuple[str, str], ...]:
     return (("y", "Yes"), ("n", "No")) if inline_yes_no else ()
 
 
-def _next_interactive_sequence(ikey: InteractiveKey, content: str) -> int:
-    """Return the sequence for *content*, advancing when the prompt changes."""
-    if _interactive_contents.get(ikey) != content:
+def _next_interactive_sequence(
+    ikey: InteractiveKey,
+    content: str,
+    prompt_fingerprint: str | None = None,
+    menu: TerminalMenu | None = None,
+) -> int:
+    """Return the sequence, advancing when rendered or terminal prompt changes."""
+    if (
+        _interactive_contents.get(ikey) != content
+        or _interactive_prompt_fingerprints.get(ikey) != prompt_fingerprint
+        or _interactive_menus.get(ikey) != menu
+    ):
         _interactive_contents[ikey] = content
+        _interactive_prompt_fingerprints[ikey] = prompt_fingerprint
         _interactive_sequences[ikey] = _interactive_sequences.get(ikey, 0) + 1
+    if menu is None:
+        _interactive_menus.pop(ikey, None)
+    else:
+        _interactive_menus[ikey] = menu
     return _interactive_sequences.setdefault(ikey, 1)
+
+
+def get_interactive_prompt_fingerprint(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+    message_id: int | None,
+) -> str | None:
+    """Return the captured terminal prompt fingerprint for this live keyboard."""
+    if chat_id is None or message_id is None:
+        return None
+    ikey = _interactive_key(user_id, thread_id, chat_id)
+    if _interactive_msgs.get(ikey) != message_id:
+        return None
+    return _interactive_prompt_fingerprints.get(ikey)
+
+
+def is_current_interactive_message(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int | None,
+    message_id: int | None,
+) -> bool:
+    """Whether the callback belongs to the currently rendered keyboard."""
+    if chat_id is None or message_id is None:
+        return False
+    ikey = _interactive_key(user_id, thread_id, chat_id)
+    return _interactive_msgs.get(ikey) == message_id
 
 
 def is_current_interactive_prompt(
@@ -319,12 +433,60 @@ def is_current_interactive_prompt(
     if chat_id is None or message_id is None:
         return False
     ikey = _interactive_key(user_id, thread_id, chat_id)
+    if _interactive_msgs.get(ikey) != message_id:
+        return False
+    # The currently shown keyboard is answerable even when advisory (a
+    # true-positive structural guess such as /remote-control): blocking
+    # mode gates text forwarding, not taps.
+    if _interactive_mode.get(ikey) == window_id:
+        blocking_prompt = True
+    else:
+        blocking_prompt = _interactive_mode.get(ikey) is None
     return (
-        _interactive_mode.get(ikey) == window_id
-        and _interactive_msgs.get(ikey) == message_id
+        blocking_prompt
         and _interactive_contexts.get(ikey) == (chat_id, message_id)
         and _interactive_sequences.get(ikey) == sequence
     )
+
+
+def get_menu_reply_target(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    window_id: str,
+) -> tuple[str | None, str, TerminalMenu] | None:
+    """Reject replies to a retired/replaced menu, even in the same message."""
+    ikey = _interactive_key(user_id, thread_id, chat_id)
+    fingerprint = _interactive_prompt_fingerprints.get(ikey)
+    if (
+        _interactive_mode.get(ikey) != window_id
+        or _interactive_msgs.get(ikey) != message_id
+        or _interactive_contents.get(ikey) != text
+        or fingerprint is None
+    ):
+        return None
+    menu = _interactive_menus.get(ikey)
+    if menu is None:
+        return None
+    return _interactive_panes.get(ikey), fingerprint, menu
+
+
+def get_interactive_menu(
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int,
+    message_id: int,
+    window_id: str,
+) -> TerminalMenu | None:
+    ikey = _interactive_key(user_id, thread_id, chat_id)
+    if (
+        _interactive_msgs.get(ikey) != message_id
+        or _interactive_mode.get(ikey) != window_id
+    ):
+        return None
+    return _interactive_menus.get(ikey)
 
 
 def advance_interactive_sequence(
@@ -345,6 +507,8 @@ def _build_interactive_keyboard(
     pane_id: str | None = None,
     direct_choices: tuple[tuple[str, str], ...] = (),
     sequence: int = 0,
+    menu: TerminalMenu | None = None,
+    advisory: bool = False,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
@@ -354,6 +518,11 @@ def _build_interactive_keyboard(
     When ``pane_id`` is set, it is appended to each callback data so
     responses route to a specific pane instead of the window's active pane.
     """
+    if menu is not None and not advisory:
+        return build_menu_keyboard(
+            window_id, menu, pane_id, sequence, compact_callback_data
+        )
+
     # Lazy: pane delimiter constant
     from ..callback_data import CB_PANE_DELIMITER
 
@@ -365,7 +534,9 @@ def _build_interactive_keyboard(
     def btn(label: str, prefix: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(
             label,
-            callback_data=compact_callback_data(prefix, f"{prefix}{target}", window_id),
+            callback_data=compact_callback_data(
+                prefix, f"{prefix}{sequence}:{target}", window_id
+            ),
         )
 
     def choice_btn(key: str, label: str) -> InlineKeyboardButton:
@@ -374,6 +545,9 @@ def _build_interactive_keyboard(
             label,
             callback_data=compact_callback_data(CB_ASK_CHOICE, payload, window_id),
         )
+
+    if advisory:
+        return InlineKeyboardMarkup([[btn("🔄", CB_ASK_REFRESH)]])
 
     rows: list[list[InlineKeyboardButton]] = []
     # Direct choices come first, while the complete navigation keyboard remains
@@ -417,8 +591,6 @@ async def _edit_interactive_msg(
     msg_id: int,
     text: str,
     keyboard: InlineKeyboardMarkup,
-    ikey: InteractiveKey,
-    window_id: str,
 ) -> bool | None:
     """Try to edit an existing interactive message.
 
@@ -432,7 +604,6 @@ async def _edit_interactive_msg(
             reply_markup=keyboard,
             link_preview_options=NO_LINK_PREVIEW,
         )
-        _interactive_mode[ikey] = window_id
         return True
     except BadRequest as e:
         if "Message is not modified" in e.message:
@@ -449,7 +620,7 @@ async def _edit_interactive_msg(
 async def _capture_interactive_content(
     window_id: str,
     pane_id: str | None = None,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, bool, TerminalMenu | None] | None:
     """Capture pane and extract interactive UI content.
 
     When *pane_id* is given, captures that specific pane (by stable ``%N`` ID)
@@ -489,7 +660,12 @@ async def _capture_interactive_content(
         )
         return None
 
-    return status.ui_type, status.raw_text
+    return (
+        status.ui_type,
+        status.raw_text,
+        status.ui_advisory,
+        (None if status.ui_advisory else status.menu),
+    )
 
 
 def _lookup_pane_name(window_id: str, pane_id: str) -> str | None:
@@ -552,6 +728,42 @@ async def _send_interactive_with_retry(
     return None
 
 
+class PromptStateError(Exception):
+    """The pane could not be read; no dismissal verdict is possible."""
+
+
+async def pane_has_interactive_prompt(
+    window_id: str,
+    pane_id: str | None = None,
+) -> bool:
+    """Whether the pane still shows an interactive prompt right now.
+
+    Used by the dismissal path to CONFIRM the Escape landed: capture the
+    owning pane and run the same detector the poller uses. Raises
+    PromptStateError when the capture itself fails: an unreadable pane
+    proves nothing, and a failed capture must never count as "prompt
+    gone" (a modal may still be open and would eat the forwarded text
+    as an answer).
+    """
+    if pane_id:
+        pane_text = await tmux_manager.capture_pane_by_id(pane_id, window_id=window_id)
+    else:
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            raise PromptStateError(f"window {window_id} not found")
+        pane_text = await tmux_manager.capture_pane(w.window_id)
+    if not pane_text:
+        raise PromptStateError(f"no pane text captured for {window_id} pane {pane_id}")
+    provider = get_provider_for_window(
+        window_id, provider_name=get_window_provider(window_id)
+    )
+    pane_title = ""
+    if provider.capabilities.uses_pane_title and not pane_id:
+        pane_title = await tmux_manager.get_pane_title(window_id)
+    status = provider.parse_terminal_status(pane_text, pane_title=pane_title)
+    return status is not None and status.is_interactive
+
+
 async def handle_interactive_ui(
     client: TelegramClient,
     user_id: int,
@@ -575,32 +787,68 @@ async def handle_interactive_ui(
     if not captured:
         return False
 
-    ui_name, content = captured
+    ui_name, content, advisory, menu = captured
+    prompt_fingerprint = (
+        None if advisory else hashlib.sha256(content.encode()).hexdigest()
+    )
+    # Advisory detections (structural guesses) show the keyboard but
+    # never latch blocking interactive mode: only a named pattern or a
+    # transcript tool_use may block. Advisory sends also retire any
+    # stale blocking latch from an earlier prompt.
+    blocking = not advisory
     pane_name = _lookup_pane_name(window_id, pane_id) if pane_id else None
-    text = format_interactive_message(content, pane_id=pane_id, pane_name=pane_name)
+    text = format_interactive_message(
+        content,
+        pane_id=pane_id,
+        pane_name=pane_name,
+        instruction_line=(
+            "Unverified terminal view · 🔄 refresh or use the terminal"
+            if advisory
+            else (MENU_INSTRUCTION if menu.text_input else MENU_BUTTON_INSTRUCTION)
+            if menu is not None
+            else INTERACTIVE_INSTRUCTION_LINE
+        ),
+    )
     resolved_chat_id = (
         thread_router.resolve_chat_id(user_id, thread_id)
         if chat_id is None
         else chat_id
     )
     ikey = _interactive_key(user_id, thread_id, resolved_chat_id)
-    sequence = _next_interactive_sequence(ikey, text)
+    # A sibling must not replace a visible, blocking primary-pane prompt.
+    if (
+        pane_id is not None
+        and _interactive_mode.get(ikey) == window_id
+        and ikey in _interactive_panes
+        and _interactive_panes[ikey] is None
+    ):
+        return False
+    sequence = _next_interactive_sequence(ikey, text, prompt_fingerprint, menu)
     keyboard = _build_interactive_keyboard(
         window_id,
         ui_name=ui_name,
         pane_id=pane_id,
-        direct_choices=parse_direct_choices(content),
+        direct_choices=()
+        if menu is not None or advisory
+        else parse_direct_choices(content),
         sequence=sequence,
+        menu=menu,
+        advisory=advisory,
     )
 
     # Try editing existing interactive message first
     existing_msg_id = _interactive_msgs.get(ikey)
     if existing_msg_id:
         edited = await _edit_interactive_msg(
-            client, resolved_chat_id, existing_msg_id, text, keyboard, ikey, window_id
+            client, resolved_chat_id, existing_msg_id, text, keyboard
         )
         if edited:
+            if blocking:
+                _interactive_mode[ikey] = window_id
+            else:
+                _interactive_mode.pop(ikey, None)
             _interactive_contexts[ikey] = (resolved_chat_id, existing_msg_id)
+            _interactive_panes[ikey] = pane_id
         return edited or False
 
     # Cooldown: prevent rapid retries when sends fail
@@ -633,8 +881,12 @@ async def handle_interactive_ui(
     )
     if sent:
         _interactive_msgs[ikey] = sent.message_id
+        _interactive_panes[ikey] = pane_id
         _interactive_contexts[ikey] = (resolved_chat_id, sent.message_id)
-        _interactive_mode[ikey] = window_id
+        if blocking:
+            _interactive_mode[ikey] = window_id
+        else:
+            _interactive_mode.pop(ikey, None)
         _send_cooldowns.pop(ikey, None)
     return sent is not None
 
@@ -655,9 +907,12 @@ async def clear_interactive_msg(
     ikey = _interactive_key(user_id, thread_id, resolved_chat_id)
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
+    _interactive_panes.pop(ikey, None)
     _interactive_contexts.pop(ikey, None)
     _interactive_sequences.pop(ikey, None)
     _interactive_contents.pop(ikey, None)
+    _interactive_prompt_fingerprints.pop(ikey, None)
+    _interactive_menus.pop(ikey, None)
     _send_cooldowns.pop(ikey, None)
     logger.debug(
         "Clear interactive msg: user=%d, thread=%s, chat=%s, msg_id=%s",

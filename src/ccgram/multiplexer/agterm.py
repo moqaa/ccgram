@@ -6,10 +6,10 @@ JSON shape (``tree`` / ``workspaces[]`` / ``sessions[]`` / ``surfaces[]``) and
 every ``surface:<uuid>:<role>`` locator stays **private** to this module;
 callers see only the neutral value types from ``multiplexer.base``.
 
-Identity: an agterm *session* is the unit that carries one agent, so its UUID is
-the neutral ``window_id``. agterm persists that UUID in its per-window state file
-and restores it, so unlike herdr the id survives a restart and no alias
-reconciliation is needed (``ids_stable_across_restart`` is True).
+Identity: the primary pane retains the session UUID as its ``window_id``.
+A split peer gets a separate guarded target derived from its foreground argv.
+Hidden splits are included. The peer target is refused after closure, promotion
+or a change to its argv; it never falls back to the primary pane.
 
 The backend shells out to ``agtermctl`` (the seam explicitly allows a CLI in
 place of speaking the socket directly); the socket path is passed through
@@ -22,12 +22,13 @@ Two agterm behaviours drive the shape of this adapter:
   ``--pane`` reads the visible or focused pane, while ``session type`` with no
   ``--pane`` injects into the main pane. Every capture and injection below
   therefore passes an explicit role and never relies on a default. The agent
-  ccgram drives lives in the main pane, so that role is ``left`` throughout.
-* **A split pane has no durable handle.** agterm promotes the split survivor
-  into the main pane when the primary exits, so the ``right`` role is not a
-  stable identity. ``split_window`` returns None and ``list_panes`` returns [],
-  exactly as the Protocol prescribes for a backend that cannot expose a safe
-  sibling handle.
+  target carries the explicit role for both reads and writes.
+* **A split pane has no atomically guarded input API.** Split targets are
+  checked against live argv before each operation, including the separate
+  Return injection. A topology change between that check and the RPC remains
+  a race; native token-addressed input is the upgrade path. An identical argv
+  restart is the same target. Split targets cannot close or rename the shared
+  session. ``split_window`` and raw sibling handles remain unsupported.
 
 Capabilities: agterm reports native agent status and supports workspace selection.
 It does not use the guarded topic-target flow because its session UUID is already
@@ -49,6 +50,8 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
 import structlog
 
+from ..utils import log_throttled
+from .agterm_panes import pane_sessions, split_session_id
 from .base import (
     AgentStatus,
     CaptureResult,
@@ -130,6 +133,8 @@ _KEY_BYTES: dict[str, str] = {
     "Space": " ",
     "BSpace": "\x7f",
     "BTab": "\x1b[Z",
+    "S-Tab": "\x1b[Z",
+    "S-Enter": "\x1b[13;2u",
     "Up": "\x1b[A",
     "Down": "\x1b[B",
     "Right": "\x1b[C",
@@ -138,6 +143,8 @@ _KEY_BYTES: dict[str, str] = {
     "End": "\x1b[F",
     "PageUp": "\x1b[5~",
     "PageDown": "\x1b[6~",
+    "PPage": "\x1b[5~",
+    "NPage": "\x1b[6~",
     "Delete": "\x1b[3~",
 }
 
@@ -204,6 +211,8 @@ def _key_to_bytes(token: str) -> str | None:
     """
     if token in _KEY_BYTES:
         return _KEY_BYTES[token]
+    if len(token) == 1 and token.isprintable() and not token.isspace():
+        return token
     if token.startswith("M-"):
         rest = token[2:]
         # Meta plus a single printable character is ESC then that character —
@@ -349,6 +358,9 @@ class AgtermManager:
         envelope exists. So a parsed refusal naming this session is proof of
         absence, and everything else is unknown.
         """
+        owner = split_session_id(window_id)
+        if owner is not None:
+            return await self._split_window_presence(window_id, owner)
         rc, out, _err = await self._run(
             self._with_socket(
                 ["session", "text", "--pane", _AGENT_PANE, "--target", window_id]
@@ -383,6 +395,26 @@ class AgtermManager:
             "agterm refused an existence probe", window_id=window_id, error=error, rc=rc
         )
         return None
+
+    async def _split_window_presence(self, window_id: str, owner: str) -> bool | None:
+        tree = await self._tree()
+        if tree is None:
+            return None
+        for _workspace, session in self._sessions(tree):
+            if str(session["id"]).casefold() != owner.casefold():
+                continue
+            panes = pane_sessions(session)
+            if any(
+                str(pane["id"]).casefold() == window_id.casefold() for pane in panes
+            ):
+                return True
+            foreground = session.get("splitForeground")
+            if len(panes) > 1 and (not isinstance(foreground, list) or not foreground):
+                # A protected process may hide argv without closing the pane.
+                return None
+            return False
+        # A sweep miss alone is not authoritative absence of the session.
+        return False if await self.window_exists(owner) is False else None
 
     async def _call_ok(
         self, args: Sequence[str], stdin_text: str | None = None
@@ -440,11 +472,26 @@ class AgtermManager:
         """
         window_ids = await self._open_window_ids()
         if window_ids is None:
+            log_throttled(
+                logger,
+                "agterm-window-list",
+                "agterm window list failed; window listing unconfirmed",
+                cooldown=60.0,
+                level="warning",
+            )
             return None
         workspaces: list[dict] = []
         for window_id in window_ids:
             result = await self._call(["tree", "--window", window_id])
             if result is None:
+                log_throttled(
+                    logger,
+                    f"agterm-tree:{window_id}",
+                    "agterm tree read failed for window %s; window listing unconfirmed",
+                    window_id,
+                    cooldown=60.0,
+                    level="warning",
+                )
                 return None
             tree = result.get("tree")
             if not isinstance(tree, dict):
@@ -474,6 +521,12 @@ class AgtermManager:
         command = ""
         if isinstance(foreground, list) and foreground:
             command = str(foreground[0])
+        elif isinstance(shell := session.get("foregroundShell"), str):
+            # Lazy: the providers registry imports the multiplexer during setup.
+            from ..providers.shell_infra import KNOWN_SHELLS
+
+            if shell in KNOWN_SHELLS:
+                command = shell
         return WindowRef(
             window_id=str(session.get("id", "")),
             window_name=str(session.get("name") or ""),
@@ -504,8 +557,9 @@ class AgtermManager:
             return None
         wanted = window_id.casefold()
         for _workspace, session in self._sessions(tree):
-            if str(session.get("id", "")).casefold() == wanted:
-                return session
+            for pane in pane_sessions(session):
+                if str(pane["id"]).casefold() == wanted:
+                    return pane
         return None
 
     def _in_scope(self, workspace: dict) -> bool:
@@ -535,7 +589,13 @@ class AgtermManager:
         included, and starts typing into terminals nobody pointed it at.
         """
         own = self._own_session_id
-        if own and str(session.get("id", "")).casefold() == own:
+        if (
+            own
+            and str(
+                session.get("_agterm_session_id") or session.get("id", "")
+            ).casefold()
+            == own
+        ):
             return False
         return not str(session.get("name") or "").startswith("_")
 
@@ -567,9 +627,10 @@ class AgtermManager:
         if tree is None:
             return []
         return [
-            self._to_window(session, workspace)
+            self._to_window(pane, workspace)
             for workspace, session in self._sessions(tree)
             if self._in_scope(workspace) and self._is_adoptable(session)
+            for pane in pane_sessions(session)
         ]
 
     async def list_windows_for_reconciliation(self) -> list[WindowRef] | None:
@@ -589,8 +650,9 @@ class AgtermManager:
         if tree is None:
             return None
         return [
-            self._to_window(session, workspace)
+            self._to_window(pane, workspace)
             for workspace, session in self._sessions(tree)
+            for pane in pane_sessions(session)
         ]
 
     async def list_workspaces(self) -> list[WorkspaceRef]:
@@ -630,7 +692,17 @@ class AgtermManager:
         target, so a probe would double every call on the polling path and
         still leave a window between the check and the read.
         """
-        args = ["session", "text", "--pane", _AGENT_PANE, "--target", window_id]
+        owner = split_session_id(window_id)
+        if owner is not None and await self._find_session(window_id) is None:
+            return None
+        args = [
+            "session",
+            "text",
+            "--pane",
+            "right" if owner else _AGENT_PANE,
+            "--target",
+            owner or window_id,
+        ]
         if lines is not None and lines > 0:
             args += ["--lines", str(lines)]
         result = await self._call(args)
@@ -691,15 +763,18 @@ class AgtermManager:
         ``--stdin`` keeps arbitrary control bytes out of argv, where the
         argument parser could mangle them.
         """
+        owner = split_session_id(window_id)
+        if owner is not None and await self._find_session(window_id) is None:
+            return False
         return await self._call_ok(
             [
                 "session",
                 "type",
                 "--stdin",
                 "--pane",
-                _AGENT_PANE,
+                "right" if owner else _AGENT_PANE,
                 "--target",
-                window_id,
+                owner or window_id,
             ],
             payload,
         )
@@ -788,12 +863,13 @@ class AgtermManager:
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
         """Reject raw pane locators; only a session id may authorise a write."""
         if window_id is None or pane_id != window_id:
             logger.warning("Rejected raw agterm pane write")
             return False
-        return await self.send(window_id, text, enter=enter, literal=literal)
+        return await self.send(window_id, text, enter=enter, literal=literal, raw=raw)
 
     async def send_keys_to_pane(
         self,
@@ -811,10 +887,14 @@ class AgtermManager:
 
     async def kill_window(self, window_id: str) -> bool:
         """Close the session. True on success."""
+        if split_session_id(window_id) is not None:
+            return False
         return await self._call_ok(["session", "close", "--target", window_id])
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename the session's sidebar label. True on success."""
+        if split_session_id(window_id) is not None:
+            return False
         return await self._call_ok(
             ["session", "rename", new_name, "--target", window_id]
         )
@@ -993,13 +1073,12 @@ class AgtermManager:
         prompt" (confirmed by agterm's author, umputun/agterm#508; their godoc
         named only the shell case and has been corrected).
 
-        The shell provider does not work on this backend, and a shell name
-        would not fix it. agterm 0.25 adds ``foregroundShell`` for the case
-        where a recognised shell holds the pane, but a shell builtin such as
-        ``read`` or ``vared``, and a shell loop, run inside the shell process,
-        so argv stays the shell's: a pane blocked on input is indistinguishable
-        from one at a prompt and both report the same name. Installing a prompt
-        marker on that signal would type into a running ``read``.
+        ``_to_window`` exposes ``foregroundShell`` for provider classification,
+        but this method must not fabricate argv from that hint. A shell builtin
+        such as ``read`` or ``vared``, and a shell loop, run inside the shell
+        process: a pane blocked on input is indistinguishable from one at a
+        prompt. Synthetic bare-shell argv would let prompt setup send C-c and
+        inject commands into that running builtin.
 
         The provider detector classifies this argv directly because agterm cannot
         provide a process-group ID. This preserves provider detection behind

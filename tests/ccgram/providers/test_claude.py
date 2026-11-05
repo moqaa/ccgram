@@ -14,6 +14,7 @@ from ccgram.providers._resume import discover_claude_sessions, index_message_cou
 from ccgram.providers.codex import CodexProvider
 from ccgram.providers.gemini import GeminiProvider
 from ccgram.providers.shell import ShellProvider
+from ccgram.session_protocol.messages import SourceEntry, build_messages
 
 
 @pytest.mark.parametrize(
@@ -33,7 +34,8 @@ _PICKER_COMMANDS = {
     # "status" is deliberately absent from Claude's set: it prints a report
     # rather than opening a TUI picker.
     ClaudeProvider: {
-        "agents",
+        "config",
+        "help",
         "copy",
         "diff",
         "effort",
@@ -46,7 +48,17 @@ _PICKER_COMMANDS = {
         "theme",
         "tui",
     },
-    CodexProvider: {"model", "permissions", "skills", "statusline", "personality"},
+    CodexProvider: {
+        "config",
+        "keymap",
+        "model",
+        "permissions",
+        "review",
+        "skills",
+        "statusline",
+        "theme",
+        "title",
+    },
     GeminiProvider: {
         "agents",
         "auth",
@@ -71,6 +83,43 @@ _PICKER_COMMANDS = {
 )
 def test_picker_commands_exact_set(cls, expected) -> None:
     assert cls().capabilities.tui_picker_commands == frozenset(expected)
+
+
+class TestClaudeTerminalStatus:
+    def test_preserves_advisory_selection_guess(self) -> None:
+        pane = "Pick an action:\n❯ 1. First\n  2. Second"
+
+        status = ClaudeProvider().parse_terminal_status(pane)
+
+        assert status is not None
+        assert status.is_interactive is True
+        assert status.ui_type == "SelectionUI"
+        assert status.ui_advisory is True
+
+    @pytest.mark.parametrize(
+        ("pane", "expected_ui_type"),
+        [
+            pytest.param(
+                "Do you want to proceed?\n\n❯ Yes\n  No\n\nEsc to cancel\n",
+                "PermissionPrompt",
+                id="permission-prompt",
+            ),
+            pytest.param(
+                "☐ First option\n☐ Second option\nEnter to select\n",
+                "AskUserQuestion",
+                id="question-prompt",
+            ),
+        ],
+    )
+    def test_named_prompts_are_not_advisory(
+        self, pane: str, expected_ui_type: str
+    ) -> None:
+        status = ClaudeProvider().parse_terminal_status(pane)
+
+        assert status is not None
+        assert status.is_interactive is True
+        assert status.ui_type == expected_ui_type
+        assert status.ui_advisory is False
 
 
 class TestScrapeCurrentMode:
@@ -135,90 +184,81 @@ class TestModeShortLabel:
         assert _mode_short_label("something weird") is None
 
 
-class TestParseTranscriptEntries:
-    """Characterization: parse_transcript_entries wraps ParsedEntry fields into AgentMessage."""
+class TestCanonicalTranscriptMessages:
+    @staticmethod
+    def _messages(entries: list[dict]):
+        return build_messages(
+            [SourceEntry(offset, entry) for offset, entry in enumerate(entries)],
+            "claude-test",
+            "claude",
+        )
 
-    def _entry(self, msg_type: str, content: list) -> dict:
-        return {
-            "type": msg_type,
-            "message": {"content": content},
-            "timestamp": "2024-01-01T00:00:00.000Z",
-        }
-
-    def test_assistant_text_wrapped(self):
-        provider = ClaudeProvider()
-        entries = [self._entry("assistant", [{"type": "text", "text": "hello world"}])]
-        messages, remaining = provider.parse_transcript_entries(entries, {})
+    def test_assistant_text_is_normalized(self):
+        messages = self._messages(
+            [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "hello world"}]},
+                    "timestamp": "2024-01-01T00:00:00.000Z",
+                }
+            ]
+        )
         assert len(messages) == 1
-        m = messages[0]
-        assert m.role == "assistant"
-        assert m.content_type == "text"
-        assert m.text == "hello world"
-        assert m.timestamp == "2024-01-01T00:00:00.000Z"
-        assert not remaining
+        assert messages[0].role == "agent"
+        assert messages[0].parts[0].type == "text"
+        assert messages[0].parts[0].text == "hello world"
+        assert messages[0].time == "2024-01-01T00:00:00.000Z"
 
-    def test_tool_use_and_result_wrapped(self):
-        provider = ClaudeProvider()
-        entries = [
-            self._entry(
-                "assistant",
-                [
-                    {
-                        "type": "tool_use",
-                        "id": "t1",
-                        "name": "Read",
-                        "input": {"file_path": "x.py"},
-                    }
-                ],
-            ),
-            self._entry(
-                "user",
-                [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "t1",
-                        "content": "3 lines\nof\ntext",
-                    }
-                ],
-            ),
-        ]
-        messages, remaining = provider.parse_transcript_entries(entries, {})
-        tool_use_msgs = [m for m in messages if m.content_type == "tool_use"]
-        tool_result_msgs = [m for m in messages if m.content_type == "tool_result"]
-        assert len(tool_use_msgs) == 1
-        assert tool_use_msgs[0].tool_use_id == "t1"
-        assert tool_use_msgs[0].tool_name == "Read"
-        assert len(tool_result_msgs) == 1
-        assert tool_result_msgs[0].tool_use_id == "t1"
-        assert not remaining
-
-    def test_carry_over_pending_tools(self):
-        provider = ClaudeProvider()
-        entries = [
-            self._entry(
-                "assistant",
-                [
-                    {
-                        "type": "tool_use",
-                        "id": "t2",
-                        "name": "Bash",
-                        "input": {"command": "ls"},
-                    }
-                ],
-            ),
-        ]
-        messages, remaining = provider.parse_transcript_entries(entries, {})
-        assert "t2" in remaining
-
-    def test_unknown_entry_type_skipped(self):
-        provider = ClaudeProvider()
-        entries = [
-            {"type": "summary", "message": {"content": "ignored"}},
-            self._entry("assistant", [{"type": "text", "text": "kept"}]),
-        ]
-        messages, remaining = provider.parse_transcript_entries(entries, {})
+    def test_tool_result_updates_the_call_in_its_message(self):
+        messages = self._messages(
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Read",
+                                "input": {"file_path": "x.py"},
+                            }
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": "3 lines\nof\ntext",
+                            }
+                        ]
+                    },
+                },
+            ]
+        )
         assert len(messages) == 1
-        assert messages[0].text == "kept"
+        tool = messages[0].parts[0]
+        assert tool.type == "tool"
+        assert tool.tool_call_id == "t1"
+        assert tool.name == "Read"
+        assert tool.status == "completed"
+        assert tool.output == {"text": "3 lines\nof\ntext", "truncated": False}
+
+    def test_unknown_entry_type_is_skipped(self):
+        messages = self._messages(
+            [
+                {"type": "summary", "message": {"content": "ignored"}},
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "kept"}]},
+                },
+            ]
+        )
+        assert len(messages) == 1
+        assert messages[0].parts[0].text == "kept"
 
 
 class TestDiscoverClaudeSessions:

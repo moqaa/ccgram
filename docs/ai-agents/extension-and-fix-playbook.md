@@ -31,12 +31,12 @@ Add a new slash command (agent-side, e.g. for Claude):
 
 1. Add to the agent's command surface (e.g. `.claude/commands/` for Claude).
 2. `command_catalog.py` discovers it on next scan (60s TTL).
-3. `cc_commands.py` registers it in the Telegram `/commands` menu.
-4. No bot-side code unless special Telegram UI is needed.
+3. The pinned topic `/commands` panel displays the provider-native name and forwards that exact name.
+4. The native Telegram `/` menu remains limited to the four shared CCGram controls. Add bot-side code only for new panel behavior.
 
 Add file upload handling:
 
-- `handlers/file_handler.py` handles photos/documents. Saved to `.ccgram-uploads/` under the config dir. Agent notified via tmux keys with the path. Extend `file_handler.py` for new media types or post-processing.
+- `handlers/file_handler.py` handles photos/documents. Saved to `.ccgram-uploads/` in the session's cwd. Agent notified via tmux keys with the absolute path; the Telegram reply keeps the relative form. Extend `file_handler.py` for new media types or post-processing.
 
 Add a new LLM provider (shell command generation):
 

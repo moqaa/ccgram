@@ -7,6 +7,8 @@ Key functions:
   resolve_session_for_window: find ClaudeSession for a tmux window
   find_users_for_session: find users bound to a session
   get_recent_messages: read paginated message history
+  resolve_chat_id: resolve the delivery chat for a polling topic without a
+      direct handler import of the thread-router singleton
 
 Each wrapper imports ``session_resolver`` lazily on purpose: handlers
 that only need read-only resolution (the whole point of this module)
@@ -22,6 +24,22 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .session_resolver import ClaudeSession
+
+
+def iter_bound_topics() -> list[tuple[int, int | None, int, str]]:
+    """(user_id, chat_id, thread_id, window_id) for every bound topic."""
+    # Lazy: the router is installed by SessionManager during bootstrap.
+    from .thread_router import thread_router
+
+    return list(thread_router.iter_thread_bindings_with_chat())
+
+
+def resolve_chat_id(user_id: int, thread_id: int | None = None) -> int:
+    """Resolve a topic's delivery chat for handlers subject to the layering audit."""
+    # Lazy: the router is installed by SessionManager during bootstrap.
+    from .thread_router import thread_router
+
+    return thread_router.resolve_chat_id(user_id, thread_id)
 
 
 async def resolve_session_for_window(window_id: str) -> "ClaudeSession | None":
@@ -58,3 +76,11 @@ async def get_recent_messages(
     return await session_resolver.get_recent_messages(
         window_id, start_byte=start_byte, end_byte=end_byte
     )
+
+
+def resolve_window_for_topic(user_id: int, thread_id: int, chat_id: int) -> str | None:
+    """Resolve an exact user/chat/topic binding through the routing read seam."""
+    # Lazy: the router is installed by SessionManager during bootstrap.
+    from .thread_router import thread_router
+
+    return thread_router.resolve_window_for_thread(user_id, thread_id, chat_id)

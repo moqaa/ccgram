@@ -44,6 +44,7 @@ _PTB_BOT_ALLOWLIST = frozenset(
         "commands/__init__.py",
         "commands/forward.py",
         "commands/menu_sync.py",
+        "commands/panel.py",  # rebuilds PTB Updates for existing command handlers.
         "file_handler.py",
         "last_reply.py",  # wraps get_bot() in PTBTelegramClient for send_last_reply
         "live/pane_callbacks.py",
@@ -82,6 +83,7 @@ _SINGLETON_ALLOWLIST = frozenset(
         "commands/__init__.py",
         "commands/forward.py",
         "commands/menu_sync.py",
+        "commands/panel.py",  # resolves the owner-scoped topic before dispatch.
         "file_handler.py",
         "hook_events.py",
         "interactive/interactive_ui.py",
@@ -118,8 +120,15 @@ _SINGLETON_ALLOWLIST = frozenset(
         "sync_command.py",
         "text/text_handler.py",
         "toolbar/toolbar_callbacks.py",
+        # /bind reuses the window picker: it resolves the bound window for the
+        # topic and lists unbound windows, exactly the routing the picker
+        # callbacks do.
+        "topics/bind_command.py",
         "topics/directory_browser.py",
         "topics/directory_callbacks.py",
+        # typed_topic reads the user's MRU projects and owns the launch, the
+        # same direct-singleton pattern as window_launch_service.
+        "topics/typed_topic.py",
         # provider_mode_callbacks uses thread_router for the double-click guard
         # (same routing pattern as directory_callbacks).
         "topics/provider_mode_callbacks.py",

@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from ccgram.multiplexer.base import (
 )
 from ccgram.config import config
 from ccgram.multiplexer.tmux import TmuxManager
+from ccgram.window_resolver import LiveWindow, is_window_id, resolve_stale_ids
 
 
 @pytest.fixture
@@ -48,10 +50,38 @@ def test_capabilities_full_snapshot(mgr: TmuxManager) -> None:
         "supports_event_stream": False,
         "native_worktrees": False,
         "supports_display_name_rebind": True,
-        "recovers_stale_ids_by_name": True,
+        "recovers_stale_ids_by_name": False,
         "supports_workspace_selection": False,
         "native_topic_targets": False,
+        "supports_shell_prompt_markers": True,
     }
+
+
+def test_tmux_does_not_rebind_a_missing_id_by_display_name(
+    mgr: TmuxManager,
+) -> None:
+    old_id = "@0"
+    new_id = "@1"
+    state = SimpleNamespace(window_name="project")
+    window_states = {old_id: state}
+    thread_bindings = {100: {42: old_id}}
+    display_names = {old_id: "project"}
+
+    changed = resolve_stale_ids(
+        [LiveWindow(new_id, "project")],
+        window_states,
+        thread_bindings,
+        {},
+        display_names,
+        ids_stable=mgr.capabilities.ids_stable_across_restart,
+        window_id_predicate=is_window_id,
+        recover_stale_ids_by_name=mgr.capabilities.recovers_stale_ids_by_name,
+    )
+
+    assert changed is False
+    assert window_states == {old_id: state}
+    assert thread_bindings == {100: {42: old_id}}
+    assert display_names == {old_id: "project"}
 
 
 class _FakeWindow:
@@ -176,7 +206,7 @@ def test_reconciliation_keeps_windows_list_windows_hides(
     ineligible so discovery still refuses it.
     """
     window = TmuxManager._window_ref_for_reconciliation(  # type: ignore[arg-type]
-        _FakeWindow(window_id, window_name)
+        _FakeWindow(window_id, window_name)  # pyright: ignore[reportArgumentType]
     )
 
     assert window.window_id == window_id
@@ -186,7 +216,7 @@ def test_reconciliation_keeps_windows_list_windows_hides(
 def test_reconciliation_keeps_ccgram_own_window() -> None:
     with patch.object(config, "own_window_id", "@9"):
         window = TmuxManager._window_ref_for_reconciliation(  # type: ignore[arg-type]
-            _FakeWindow("@9", "ccgram")
+            _FakeWindow("@9", "ccgram")  # pyright: ignore[reportArgumentType]
         )
 
     assert window.window_id == "@9"
@@ -195,7 +225,7 @@ def test_reconciliation_keeps_ccgram_own_window() -> None:
 
 def test_reconciliation_marks_an_ordinary_window_adoptable() -> None:
     window = TmuxManager._window_ref_for_reconciliation(  # type: ignore[arg-type]
-        _FakeWindow("@5", "my-project")
+        _FakeWindow("@5", "my-project")  # pyright: ignore[reportArgumentType]
     )
 
     assert window.topic_eligible is True
@@ -298,10 +328,10 @@ async def test_send_forwards_to_send_keys(mgr: TmuxManager) -> None:
 
 async def test_send_to_pane_forwards(mgr: TmuxManager) -> None:
     mgr.send_keys_to_pane = AsyncMock(return_value=True)  # type: ignore[method-assign]
-    ok = await mgr.send_to_pane("%2", "hi", enter=True, literal=True, window_id="@0")
+    ok = await mgr.send_to_pane("%2", "hi", enter=False, literal=True, window_id="@0")
     assert ok is True
     mgr.send_keys_to_pane.assert_awaited_once_with(
-        "%2", "hi", enter=True, literal=True, window_id="@0"
+        "%2", "hi", enter=False, literal=True, window_id="@0"
     )
 
 
@@ -395,3 +425,23 @@ async def test_foreground_none_when_window_gone(mgr: TmuxManager) -> None:
 )
 def test_parse_ps_line(line: str, expected: tuple | None) -> None:
     assert TmuxManager._parse_ps_line(line) == expected
+
+
+async def test_foreground_preserves_argv_beyond_terminal_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = [
+        "/home/runner/work/ccgram/ccgram/.venv/bin/python",
+        "/tmp/" + "project/" * 20 + "claude",
+    ]
+    line = "321 321 S+ " + " ".join(argv)
+
+    async def spawn(*args: object, **_kwargs: object) -> AsyncMock:
+        proc = AsyncMock()
+        proc.returncode = 0
+        output = line if "-ww" in args else line[:80]
+        proc.communicate.return_value = (output.encode(), b"")
+        return proc
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+    assert await TmuxManager._ps_foreground("/dev/pts/1") == (321, 321, argv)

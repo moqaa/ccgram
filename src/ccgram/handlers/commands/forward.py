@@ -33,6 +33,7 @@ from ...telegram_client import PTBTelegramClient
 from ...window_state_store import window_store
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
+from ...session_protocol.telegram import adapter_for
 from ..telegram_origin import (
     send_telegram_followup_to_window,
     send_telegram_to_window,
@@ -122,6 +123,8 @@ async def _handle_pi_followup_command(
     args: str,
     cc_slash: str,
     thread_id: int | None,
+    *,
+    adapter,
 ) -> None:
     """Queue a Pi follow-up message via Alt+Enter."""
     if not args:
@@ -134,7 +137,7 @@ async def _handle_pi_followup_command(
         action=ChatAction.TYPING,
     )
     success, error_msg = await send_telegram_followup_to_window(
-        user_id, window_id, thread_id, args, message.chat.id
+        user_id, window_id, thread_id, args, message.chat.id, adapter=adapter
     )
     if not success:
         await safe_reply(message, f"❌ {error_msg}")
@@ -188,7 +191,6 @@ def _arm_rc_probe_if_remote_control(
 
 async def _capture_forward_probe_context(
     window_id: str,
-    provider,
     cc_slash: str,
     status_like: bool,
 ) -> tuple[str | None, int | None, str | None, int | None]:
@@ -199,7 +201,7 @@ async def _capture_forward_probe_context(
         probe_transcript_path,
         probe_transcript_offset,
         probe_pane_before,
-    ) = await _capture_command_probe_context(window_id, provider)
+    ) = await _capture_command_probe_context(window_id)
     return probe_transcript_path, probe_transcript_offset, probe_pane_before, None
 
 
@@ -237,10 +239,27 @@ async def _send_forward_post_probes(
     )
 
 
+def _command_update(update: Update, message: Message, command: str) -> Update:
+    """Adapt the callback to existing handlers without impersonating the bot."""
+    assert update.effective_user is not None
+    data = message.to_dict()
+    data.update({"text": command, "from": update.effective_user.to_dict()})
+    data.pop("entities", None)
+    data.pop("reply_markup", None)
+    adapted = Message.de_json(data, message.get_bot())
+    assert adapted is not None
+    adapted_update = Update(update.update_id, message=adapted)
+    adapted_update.set_bot(message.get_bot())
+    return adapted_update
+
+
 async def forward_command_handler(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    native_command: str | None = None,
 ) -> None:
-    """Forward any non-bot command as a slash command to the topic provider session."""
+    """Forward typed aliases or an exact native command selected in a panel."""
     user = update.effective_user
     if not user or not config.is_user_allowed(user.id):
         return
@@ -256,16 +275,36 @@ async def forward_command_handler(
     parts = cmd_text.split(None, 1)
     raw_cmd = parts[0].split("@")[0] if parts else ""
     tg_cmd = raw_cmd.lstrip("/").lower()
+    requested_command = native_command or raw_cmd
+    logger.info(
+        "Provider command request received",
+        command=requested_command,
+        user_id=user.id,
+        chat_id=chat.id,
+        thread_id=thread_id,
+    )
     # args is forwarded verbatim to the provider via tmux send-keys -l (literal mode).
     # Gated by config.is_user_allowed — authorised users can type anything into their own agent.
     args = parts[1] if len(parts) > 1 else ""
     window_id = thread_router.resolve_window_for_thread(user.id, thread_id, chat.id)
     if not window_id:
+        logger.warning(
+            "Provider command has no bound session",
+            command=requested_command,
+            user_id=user.id,
+            chat_id=chat.id,
+            thread_id=thread_id,
+        )
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
     w = await tmux_manager.find_window_by_id(window_id)
     if not w:
+        logger.warning(
+            "Provider command target window is missing",
+            command=requested_command,
+            window_id=window_id,
+        )
         display = thread_router.get_display_name(window_id)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
@@ -278,14 +317,26 @@ async def forward_command_handler(
     await sync_scoped_provider_menu(update.message, user.id, provider)
     provider_map = _build_provider_command_metadata(provider)
     resolved_name = provider_map.get(tg_cmd, tg_cmd)
-    cc_name = _provider_command_name(provider_name, resolved_name.lstrip("/"))
+    cc_name = _provider_command_name(
+        provider_name,
+        native_command.lstrip("/")
+        if native_command is not None
+        else resolved_name.lstrip("/"),
+    )
     args = _default_command_args(cc_name, args, display)
     cc_slash = f"/{cc_name} {args}".rstrip() if args else f"/{cc_name}"
     status_like = cc_name.lower() in {"status", "stats"}
 
     if provider_name == "pi" and cc_name.lower() == _PI_FOLLOWUP_COMMAND:
         await _handle_pi_followup_command(
-            update.message, user.id, window_id, display, args, cc_slash, thread_id
+            update.message,
+            user.id,
+            window_id,
+            display,
+            args,
+            cc_slash,
+            thread_id,
+            adapter=adapter_for(context.bot_data),
         )
         return
 
@@ -302,16 +353,33 @@ async def forward_command_handler(
         probe_transcript_offset,
         probe_pane_before,
         status_probe_offset,
-    ) = await _capture_forward_probe_context(window_id, provider, cc_slash, status_like)
+    ) = await _capture_forward_probe_context(window_id, cc_slash, status_like)
 
     lifecycle_strategy.clear_probe_failures(window_id)
     success, error_msg = await send_telegram_to_window(
-        user.id, window_id, thread_id, cc_slash, update.message.chat.id
+        user.id,
+        window_id,
+        thread_id,
+        cc_slash,
+        update.message.chat.id,
+        adapter=adapter_for(context.bot_data),
     )
     if not success:
+        logger.warning(
+            "Provider command delivery failed",
+            command=cc_slash,
+            window_id=window_id,
+            error=error_msg,
+        )
         await safe_reply(update.message, f"❌ {error_msg}")
         return
 
+    logger.info(
+        "Provider command delivered to terminal",
+        command=cc_slash,
+        window_id=window_id,
+        user_id=user.id,
+    )
     if thread_id is not None:
         record_command(user.id, thread_id, cc_slash)
     confirmation = f"⚡ [{display}] Sent: {cc_slash}"

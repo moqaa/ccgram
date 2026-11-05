@@ -67,8 +67,7 @@ _FLAG_TO_ENV: list[tuple[str, str]] = [
     ("tmux_session", "TMUX_SESSION_NAME"),
     ("monitor_interval", "MONITOR_POLL_INTERVAL"),
     ("group_id", "CCGRAM_GROUP_ID"),
-    ("autoclose_done", "AUTOCLOSE_DONE_MINUTES"),
-    ("autoclose_dead", "AUTOCLOSE_DEAD_MINUTES"),
+    ("unbound_window_ttl", "UNBOUND_WINDOW_TTL_MINUTES"),
     ("provider", "CCGRAM_PROVIDER"),
     ("show_hidden_dirs", "CCGRAM_SHOW_HIDDEN_DIRS"),
     ("claude_config_dir", "CLAUDE_CONFIG_DIR"),
@@ -147,20 +146,12 @@ def apply_args_to_env(**kwargs: object) -> None:
     help="Restrict to one Telegram group.",
 )
 @click.option(
-    "--autoclose-done",
+    "--unbound-window-ttl",
     type=int,
     default=None,
     callback=_validate_non_negative_int,
-    envvar="AUTOCLOSE_DONE_MINUTES",
-    help="Auto-close done topics after N minutes (default: 30, 0=disabled).",
-)
-@click.option(
-    "--autoclose-dead",
-    type=int,
-    default=None,
-    callback=_validate_non_negative_int,
-    envvar="AUTOCLOSE_DEAD_MINUTES",
-    help="Auto-close dead sessions after N minutes (default: 10, 0=disabled).",
+    envvar="UNBOUND_WINDOW_TTL_MINUTES",
+    help="Kill unbound windows after N minutes (default: 30, 0=disabled).",
 )
 @click.option(
     "--provider",
@@ -230,6 +221,11 @@ def run_cmd(**kwargs: object) -> None:
 
 @cli.command("hook")
 @click.option(
+    "--background",
+    is_flag=True,
+    help="Hand off event reporting to a detached worker and return immediately.",
+)
+@click.option(
     "--install",
     is_flag=True,
     help="Install hook into the selected provider's settings file.",
@@ -250,10 +246,16 @@ def run_cmd(**kwargs: object) -> None:
     type=click.Choice(
         ["claude", "pi", "codex", "gemini", "antigravity"], case_sensitive=False
     ),
-    default="claude",
-    help="Agent provider hook contract to use.",
+    default=None,
+    help="Agent provider hook contract (default: auto-detect; claude for setup).",
 )
-def hook_cmd(install: bool, uninstall: bool, status: bool, provider_name: str) -> None:
+def hook_cmd(
+    install: bool,
+    uninstall: bool,
+    status: bool,
+    provider_name: str | None,
+    background: bool,
+) -> None:
     """Agent session tracking hook."""
     # Lazy: defer subcommand import until that command is invoked, keeping `ccgram --help` fast
     from .hook import hook_main
@@ -262,7 +264,8 @@ def hook_cmd(install: bool, uninstall: bool, status: bool, provider_name: str) -
         install=install,
         uninstall=uninstall,
         status=status,
-        provider_name=provider_name.lower(),
+        provider_name=provider_name.lower() if provider_name else None,
+        background=background,
     )
 
 
@@ -292,3 +295,106 @@ def doctor_cmd(fix: bool) -> None:
     from .doctor_cmd import doctor_main
 
     doctor_main(fix=fix)
+
+
+@cli.command("pair")
+@click.option(
+    "--url", required=True, help="HTTPS base URL exposed by Tailscale (without /v1)."
+)
+@click.option(
+    "--config-dir", type=click.Path(path_type=Path), envvar="CCGRAM_DIR", default=None
+)
+@click.option(
+    "--json", "json_only", is_flag=True, help="Print only the pairing payload."
+)
+def pair_cmd(url: str, config_dir: Path | None, json_only: bool) -> None:
+    """Print a single-use mobile pairing payload (expires in 120 seconds)."""
+    # Lazy: protocol state is unnecessary for the normal CLI startup path.
+    from .session_protocol.store import ProtocolStore
+
+    # Lazy: directory lookup must not instantiate the bot configuration.
+    from .utils import ccgram_dir
+
+    # Lazy: pairing payloads are JSON so phone clients can import them directly.
+    import json
+
+    # Lazy: URL validation is used only by pairing.
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise click.BadParameter(
+            "url must be an HTTPS origin without credentials or a path"
+        )
+    store = ProtocolStore((config_dir or ccgram_dir()) / "protocol.sqlite3")
+    try:
+        payload = json.dumps(
+            {
+                "protocol": "ccgram/1",
+                "url": url.rstrip("/"),
+                "code": store.make_pairing_code(),
+                "fingerprint": store.fingerprint,
+            }
+        )
+        click.echo(payload)
+        if not json_only:
+            # Lazy: terminal QR generation is used only by mobile pairing.
+            import qrcode
+
+            qr = qrcode.QRCode(border=2)
+            qr.add_data(payload)
+            qr.make(fit=True)
+            qr.print_ascii(invert=True)
+    finally:
+        store.close()
+
+
+@cli.group("devices")
+def devices_cmd() -> None:
+    """List or revoke mobile clients."""
+
+
+@devices_cmd.command("list")
+def devices_list_cmd() -> None:
+    # Lazy: protocol persistence is needed only by device management.
+    from .session_protocol.store import ProtocolStore
+
+    # Lazy: avoid validating Telegram configuration for a local admin command.
+    from .utils import ccgram_dir
+
+    # Lazy: CLI output is machine-readable JSON.
+    import json
+
+    store = ProtocolStore(ccgram_dir() / "protocol.sqlite3")
+    try:
+        click.echo(json.dumps(store.devices()))
+    finally:
+        store.close()
+
+
+@devices_cmd.command("revoke")
+@click.argument("device_id")
+def devices_revoke_cmd(device_id: str) -> None:
+    # Lazy: protocol persistence is needed only by device management.
+    from .session_protocol.store import ProtocolStore
+
+    # Lazy: avoid validating Telegram configuration for a local admin command.
+    from .utils import ccgram_dir
+
+    # Lazy: translate a missing device into a Click usage error.
+    from .session_protocol.models import ProtocolError
+
+    store = ProtocolStore(ccgram_dir() / "protocol.sqlite3")
+    try:
+        store.revoke(device_id)
+    except ProtocolError as exc:
+        raise click.ClickException(exc.message) from exc
+    finally:
+        store.close()

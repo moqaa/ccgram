@@ -42,6 +42,7 @@ from ..callback_data import (
     CB_WS_SELECT,
     CB_WS_SKIP,
 )
+from ..provider_display import provider_label
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
     PENDING_WORKSPACE_ID,
@@ -98,6 +99,15 @@ def _detect_project_badge(parent: Path, name: str) -> str:
     return ""
 
 
+def _is_projects_root(path: Path) -> bool:
+    """True when *path* is one of the configured project roots."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return any(resolved == root for root in config.projects_roots)
+
+
 def clear_browse_state(user_data: dict | None) -> None:
     """Clear directory browsing state keys from user_data."""
     if user_data is not None:
@@ -131,11 +141,15 @@ def clear_window_picker_state(user_data: dict | None) -> None:
 
 def build_window_picker(
     windows: list[tuple[str, str, str]],
+    *,
+    include_new: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
     """Build window picker UI for unbound tmux windows.
 
     Args:
         windows: List of (window_id, window_name, cwd) tuples.
+        include_new: Offer the "New Session" entry (the unbound-topic flow
+            does; ``/bind`` does not, because a session line already creates one).
 
     Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
     """
@@ -163,12 +177,13 @@ def build_window_picker(
             )
         buttons.append(row)
 
-    buttons.append(
-        [
-            InlineKeyboardButton("➕ New Session", callback_data=CB_WIN_NEW),
-            InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL),
-        ]
-    )
+    action_row = []
+    if include_new:
+        action_row.append(
+            InlineKeyboardButton("➕ New Session", callback_data=CB_WIN_NEW)
+        )
+    action_row.append(InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL))
+    buttons.append(action_row)
 
     text = "\n".join(lines)
     return text, InlineKeyboardMarkup(buttons), window_ids
@@ -239,6 +254,11 @@ def build_directory_browser(
     if not path.exists() or not path.is_dir():
         path = Path.cwd()
 
+    # Under a projects root only git checkouts are listed, which is what a
+    # session can actually use. Deeper levels list every subdirectory so a
+    # repo's own layout stays navigable. CCGRAM_DIR_BROWSER_ALL_DIRS turns the
+    # filter off.
+    git_only = not config.dir_browser_all_dirs and _is_projects_root(path)
     try:
         subdirs = sorted(
             [
@@ -246,6 +266,7 @@ def build_directory_browser(
                 for d in path.iterdir()
                 if d.is_dir()
                 and (config.show_hidden_dirs or not d.name.startswith("."))
+                and (not git_only or (d / ".git").exists())
             ]
         )
     except (PermissionError, OSError):  # fmt: skip
@@ -312,13 +333,13 @@ def build_directory_browser(
 
 
 # Provider display metadata: (label, icon)
-_PROVIDER_META: dict[str, tuple[str, str]] = {
-    "antigravity": ("Antigravity", "\U0001f30c"),
-    "claude": ("Claude", "\U0001f7e0"),
-    "codex": ("Codex", "\U0001f9e9"),
-    "gemini": ("Gemini", "\u264a"),
-    "pi": ("Pi", "\U0001f916"),
-    "shell": ("Shell", "\U0001f41a"),
+_PROVIDER_ICONS: dict[str, str] = {
+    "antigravity": "\U0001f30c",
+    "claude": "\U0001f7e0",
+    "codex": "\U0001f9e9",
+    "gemini": "\u264a",
+    "pi": "\U0001f916",
+    "shell": "\U0001f41a",
 }
 
 
@@ -331,13 +352,17 @@ def build_provider_picker(selected_path: str) -> tuple[str, InlineKeyboardMarkup
     text = (
         f"*Select Provider*\n\nDirectory: `{display_path}`\n\nWhich agent CLI to use?"
     )
+    # Lazy: the providers package pulls process detection and the registry.
+    from ...providers import picker_provider_names
+
     buttons: list[list[InlineKeyboardButton]] = []
-    for name, (label, icon) in _PROVIDER_META.items():
-        suffix = " (default)" if name == "claude" else ""
+    for name in picker_provider_names():
+        icon = _PROVIDER_ICONS.get(name, "\U0001f916")
+        suffix = " (default)" if name == config.provider_name else ""
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"{icon} {label}{suffix}",
+                    f"{icon} {provider_label(name)}{suffix}",
                     callback_data=f"{CB_PROV_SELECT}{name}",
                 )
             ]
@@ -354,13 +379,12 @@ def build_mode_picker(
     Returns: (text, keyboard).
     """
     display_path = selected_path.replace(str(Path.home()), "~")
-    provider_label, provider_icon = _PROVIDER_META.get(
-        provider_name, (provider_name.title(), "🤖")
-    )
+    label = provider_label(provider_name)
+    provider_icon = _PROVIDER_ICONS.get(provider_name, "🤖")
     text = (
         "*Select Session Mode*\n\n"
         f"Directory: `{display_path}`\n"
-        f"Provider: {provider_icon} {provider_label}\n\n"
+        f"Provider: {provider_icon} {label}\n\n"
         "Choose how many approvals you want for this session."
     )
     buttons = [

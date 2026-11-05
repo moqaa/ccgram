@@ -24,6 +24,7 @@ from telegram import (
     Update,
 )
 from ..config import config
+from ..session import session_manager
 from ..telegram_client import PTBTelegramClient, TelegramClient
 from ..thread_router import thread_router
 from ..multiplexer import multiplexer as tmux_manager
@@ -33,6 +34,7 @@ from ..multiplexer.reconciliation import (
     window_presence,
 )
 from ..window_query import view_window
+from ..session_protocol.telegram import TelegramSessionAdapter, adapter_for
 from .callback_data import (
     CB_SESSIONS_KILL,
     CB_SESSIONS_KILL_CONFIRM,
@@ -45,6 +47,7 @@ from .callback_helpers import user_owns_window
 from .callback_tokens import compact_callback_data, resolve_callback_data
 from .callback_registry import register
 from .cleanup import clear_topic_state
+from .topics.topic_deletion import cleanup_retired_topics, retire_topic_binding
 from .messaging_pipeline.message_sender import safe_edit, safe_reply
 
 if TYPE_CHECKING:
@@ -180,7 +183,11 @@ async def handle_sessions_kill(
 
 
 async def handle_sessions_kill_confirm(
-    query: CallbackQuery, user_id: int, window_id: str, client: TelegramClient
+    query: CallbackQuery,
+    user_id: int,
+    window_id: str,
+    client: TelegramClient,
+    adapter: TelegramSessionAdapter,
 ) -> None:
     """Second tap — kill the tmux window, unbind all users, refresh dashboard."""
     display = thread_router.get_display_name(window_id)
@@ -199,7 +206,7 @@ async def handle_sessions_kill_confirm(
         )
         return
 
-    if presence and not await tmux_manager.kill_window(window_id):
+    if presence and not (await adapter.close(window_id))[0]:
         # The window was there a moment ago and the kill did not succeed, so
         # it may still be running. Clearing the bindings now would strand it.
         await safe_edit(
@@ -209,17 +216,32 @@ async def handle_sessions_kill_confirm(
         )
         return
 
-    # Clean up BEFORE unbind — resolve_chat_id needs group_chat_ids
-    # which unbind_thread deletes
-    for uid, tid, bound_wid in list(thread_router.iter_thread_bindings()):
+    for uid, chat_id, tid, bound_wid in list(
+        thread_router.iter_thread_bindings_with_chat()
+    ):
         if canonical_window_id(bound_wid) == canonical_window_id(window_id):
-            await clear_topic_state(uid, tid, client, window_id=bound_wid)
-            thread_router.unbind_thread(
+
+            async def clear_state_before_delete() -> None:
+                await clear_topic_state(
+                    uid,
+                    tid,
+                    client,
+                    window_id=bound_wid,
+                    chat_id=chat_id,
+                )
+
+            await retire_topic_binding(
+                client,
                 uid,
                 tid,
-                retirement_reason="stale_owned_binding",
-                cleanup_eligible=True,
+                bound_wid,
+                router=thread_router,
+                chat_id=chat_id,
+                before_delete=clear_state_before_delete,
             )
+
+    session_manager.flush_state()
+    await cleanup_retired_topics(client, router=thread_router)
 
     logger.info(
         "sessions_kill_confirm: killed window %s (%s), user=%d",
@@ -264,7 +286,11 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("Not your session", show_alert=True)
             return
         await handle_sessions_kill_confirm(
-            query, user.id, window_id, PTBTelegramClient(context.bot)
+            query,
+            user.id,
+            window_id,
+            PTBTelegramClient(context.bot),
+            adapter_for(context.bot_data),
         )
         await query.answer("Killed")
     elif data.startswith(CB_SESSIONS_KILL):

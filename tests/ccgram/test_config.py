@@ -1,8 +1,16 @@
+import os
 from pathlib import Path
 
 import pytest
 
-from ccgram.config import Config
+from ccgram.config import (
+    DEFAULT_ENABLED_PROVIDERS,
+    Config,
+    _delivery_watch_gap_bytes,
+    _enabled_providers_env,
+    _projects_roots_env,
+    _skip_barrier_deadline_s,
+)
 
 
 @pytest.fixture
@@ -18,6 +26,7 @@ class TestConfigValid:
         cfg = Config()
         assert cfg.telegram_bot_token == "test:token"
         assert cfg.allowed_users == {12345}
+        assert cfg.unbound_window_ttl_minutes == 30
 
     def test_custom_tmux_session_name(self, monkeypatch):
         monkeypatch.setenv("TMUX_SESSION_NAME", "mysession")
@@ -121,6 +130,26 @@ class TestShowHiddenDirs:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestAutodeleteDeadTopics:
+    def test_autodelete_dead_topics_default_true(self, monkeypatch):
+        monkeypatch.delenv("CCGRAM_AUTODELETE_DEAD_TOPICS", raising=False)
+        cfg = Config()
+        assert cfg.autodelete_dead_topics is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "False", "OFF"])
+    def test_autodelete_dead_topics_disabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_AUTODELETE_DEAD_TOPICS", value)
+        cfg = Config()
+        assert cfg.autodelete_dead_topics is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "anything-else"])
+    def test_autodelete_dead_topics_enabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_AUTODELETE_DEAD_TOPICS", value)
+        cfg = Config()
+        assert cfg.autodelete_dead_topics is True
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestHideToolCalls:
     def test_hide_tool_calls_default_false(self, monkeypatch):
         monkeypatch.delenv("CCGRAM_HIDE_TOOL_CALLS", raising=False)
@@ -203,23 +232,6 @@ class TestSyncTopicNameFromWindow:
     def test_disabled(self, monkeypatch, value):
         monkeypatch.setenv("CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW", value)
         assert Config().sync_topic_name_from_window is False
-
-
-@pytest.mark.usefixtures("_base_env")
-class TestDeleteDeadTopics:
-    def test_default_false(self, monkeypatch):
-        monkeypatch.delenv("CCGRAM_DELETE_DEAD_TOPICS", raising=False)
-        assert Config().delete_dead_topics is False
-
-    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "YES"])
-    def test_enabled(self, monkeypatch, value):
-        monkeypatch.setenv("CCGRAM_DELETE_DEAD_TOPICS", value)
-        assert Config().delete_dead_topics is True
-
-    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off"])
-    def test_disabled(self, monkeypatch, value):
-        monkeypatch.setenv("CCGRAM_DELETE_DEAD_TOPICS", value)
-        assert Config().delete_dead_topics is False
 
 
 @pytest.mark.usefixtures("_base_env")
@@ -325,3 +337,108 @@ class TestPollingConfig:
         assert getattr(Config(), attr) == expected
         monkeypatch.setenv(env_var, clamp_str)
         assert getattr(Config(), attr) == clamped
+
+
+class TestTypedTopicKeywords:
+    """Knobs that replace the old picker steps with defaults."""
+
+    @pytest.mark.usefixtures("_base_env")
+    def test_defaults_are_the_fewest_steps_path(self, monkeypatch, tmp_path) -> None:
+        root = tmp_path / "Workspace"
+        root.mkdir()
+        monkeypatch.setenv("CCGRAM_PROJECTS_ROOTS", str(root))
+        cfg = Config()
+
+        assert cfg.default_mode == "yolo"
+        assert cfg.projects_roots == [root.resolve()]
+        assert cfg.new_topic_worktrees is False
+        assert cfg.workspace_picker is False
+        assert cfg.bind_picker is False
+        assert cfg.autostart_trust is True
+        assert cfg.dir_browser_all_dirs is False
+        assert cfg.enabled_providers == DEFAULT_ENABLED_PROVIDERS
+
+    @pytest.mark.usefixtures("_base_env")
+    def test_each_knob_can_be_turned_back_on(self, monkeypatch, tmp_path) -> None:
+        root = tmp_path / "Workspace"
+        root.mkdir()
+        monkeypatch.setenv("CCGRAM_PROJECTS_ROOTS", str(root))
+        monkeypatch.setenv("CCGRAM_DEFAULT_MODE", "normal")
+        monkeypatch.setenv("CCGRAM_NEW_TOPIC_WORKTREES", "on")
+        monkeypatch.setenv("CCGRAM_WORKSPACE_PICKER", "yes")
+        monkeypatch.setenv("CCGRAM_BIND_PICKER", "1")
+        monkeypatch.setenv("CCGRAM_AUTOSTART_TRUST", "off")
+        monkeypatch.setenv("CCGRAM_DIR_BROWSER_ALL_DIRS", "true")
+        cfg = Config()
+
+        assert cfg.default_mode == "normal"
+        assert cfg.new_topic_worktrees is True
+        assert cfg.workspace_picker is True
+        assert cfg.bind_picker is True
+        assert cfg.autostart_trust is False
+        assert cfg.dir_browser_all_dirs is True
+
+    def test_invalid_mode_falls_back_to_yolo(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_DEFAULT_MODE", "whatever")
+        assert Config().default_mode == "yolo"
+
+    def test_projects_roots_honor_pathsep_and_drop_missing(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        first.mkdir()
+        second.mkdir()
+        missing = tmp_path / "gone"
+        monkeypatch.setenv(
+            "CCGRAM_PROJECTS_ROOTS",
+            os.pathsep.join([str(first), str(second), str(missing)]),
+        )
+        assert _projects_roots_env() == [first.resolve(), second.resolve()]
+
+    def test_projects_roots_default_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("CCGRAM_PROJECTS_ROOTS", raising=False)
+        roots = _projects_roots_env()
+        assert roots and all(root.is_dir() for root in roots)
+
+    def test_enabled_providers_default_excludes_gemini(self, monkeypatch) -> None:
+        monkeypatch.delenv("CCGRAM_PROVIDERS_ENABLED", raising=False)
+        assert "gemini" not in _enabled_providers_env()
+
+
+class TestSkipBarrierDeadline:
+    def test_default_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", raising=False)
+        assert _skip_barrier_deadline_s() == 600.0
+
+    def test_override_honored_above_floor(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", "1200")
+        assert _skip_barrier_deadline_s() == 1200.0
+
+    @pytest.mark.parametrize("raw", ["", "abc", "10m", "inf", "-inf", "nan"])
+    def test_invalid_values_fall_back(self, monkeypatch, raw) -> None:
+        monkeypatch.setenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", raw)
+        assert _skip_barrier_deadline_s() == 600.0
+
+    def test_below_floor_clamped(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_SKIP_BARRIER_DEADLINE_S", "5")
+        assert _skip_barrier_deadline_s() == 60.0
+
+
+class TestDeliveryWatchGap:
+    def test_default_when_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("CCGRAM_DELIVERY_WATCH_GAP_KB", raising=False)
+        assert _delivery_watch_gap_bytes() == 256 * 1024
+
+    def test_override_honored(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_DELIVERY_WATCH_GAP_KB", "64")
+        assert _delivery_watch_gap_bytes() == 64 * 1024
+
+    def test_zero_disables(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_DELIVERY_WATCH_GAP_KB", "0")
+        assert _delivery_watch_gap_bytes() == 0
+
+    @pytest.mark.parametrize("raw", ["", "abc", "10mb", "inf", "nan", "1e308"])
+    def test_invalid_values_fall_back(self, monkeypatch, raw) -> None:
+        monkeypatch.setenv("CCGRAM_DELIVERY_WATCH_GAP_KB", raw)
+        assert _delivery_watch_gap_bytes() == 256 * 1024

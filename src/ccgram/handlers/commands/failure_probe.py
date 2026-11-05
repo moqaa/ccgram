@@ -27,6 +27,7 @@ from telegram import Message
 from ...providers import AgentProvider
 from ... import window_query
 from ...multiplexer import multiplexer as tmux_manager
+from ...session_protocol.messages import parse_records, read_entries
 from ...utils import task_done_callback
 from ..messaging_pipeline.message_sender import safe_reply
 
@@ -44,16 +45,75 @@ _COMMAND_ERROR_RE = re.compile(
     r"not recognized"
     r")\b"
 )
+_COMMAND_TOKEN_RE = re.compile(
+    r"""(?P<quote>['"`])(?P<quoted>/.*?)(?P=quote)|(?<![\w/'"`])(?P<bare>/[^\s]+)"""
+)
+_COMMAND_SUGGESTION_RE = re.compile(
+    r"(?i)\b(?:did you mean|did you intend|perhaps you meant|maybe you meant|suggestions?|suggested command|try)\b"
+)
 
 
-def _extract_probe_error_line(text: str) -> str | None:
+def _token_matches_command(match: re.Match[str], command: str) -> bool:
+    quoted = match.group("quoted")
+    token = quoted if quoted is not None else match.group("bare")
+    value = token.casefold()
+    expected = command.casefold()
+    if value == expected:
+        return True
+    # Only punctuation after the complete dispatched name is a sentence suffix.
+    return (
+        quoted is None
+        and value.startswith(expected)
+        and all(character in ".,;!?" for character in value[len(expected) :])
+    )
+
+
+def _matches_dispatched_command(line: str, cc_slash: str) -> bool:
+    command = cc_slash.split(maxsplit=1)[0]
+    if not command.startswith("/"):
+        return False
+
+    errors = list(_COMMAND_ERROR_RE.finditer(line))
+    if not errors:
+        generic_error = re.search(r"(?i)\berror\b[^;]*?\bcommand\b", line)
+        if generic_error:
+            errors.append(generic_error)
+
+    # Suggestion words inside a command name are not suggestion clauses.
+    masked = _COMMAND_TOKEN_RE.sub(lambda match: " " * len(match.group()), line)
+    for error in errors:
+        suggestion = _COMMAND_SUGGESTION_RE.search(masked, error.end())
+        end = suggestion.start() if suggestion else len(line)
+        match = _COMMAND_TOKEN_RE.search(line, error.end(), end)
+        if (
+            match
+            and _token_matches_command(match, command)
+            and re.fullmatch(r"""[\s:'"`(]*""", line[error.end() : match.start()])
+        ):
+            return True
+        if error.group().casefold() == "not recognized":
+            preceding = list(_COMMAND_TOKEN_RE.finditer(line, 0, error.start()))
+            if preceding:
+                match = preceding[-1]
+                gap = line[match.end() : error.start()]
+                if _token_matches_command(match, command) and re.fullmatch(
+                    r"""[\s'"`]*(?:(?:was|is)\s+)?""", gap, re.IGNORECASE
+                ):
+                    return True
+    return False
+
+
+def _extract_probe_error_line(text: str, cc_slash: str | None = None) -> str | None:
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if _COMMAND_ERROR_RE.search(line):
-            return line
-        if "error" in line.lower() and "command" in line.lower():
+        has_error = _COMMAND_ERROR_RE.search(line) or (
+            "error" in line.lower() and "command" in line.lower()
+        )
+        if has_error and (
+            cc_slash is None or _matches_dispatched_command(line, cc_slash)
+        ):
             return line
     return None
 
@@ -80,7 +140,6 @@ def _extract_pane_delta(before: str | None, after: str | None) -> str:
 
 async def _capture_command_probe_context(
     window_id: str,
-    provider: AgentProvider,
 ) -> tuple[str | None, int | None, str | None]:
     """Capture transcript offset + pane snapshot before sending a command."""
     view = window_query.view_window(window_id)
@@ -90,14 +149,7 @@ async def _capture_command_probe_context(
     since_offset: int | None = None
     if transcript_path:
         try:
-            if provider.capabilities.supports_incremental_read:
-                since_offset = Path(transcript_path).stat().st_size
-            else:
-                _, since_offset = await asyncio.to_thread(
-                    provider.read_transcript_file,
-                    transcript_path,
-                    0,
-                )
+            since_offset = Path(transcript_path).stat().st_size
         except OSError:
             since_offset = None
     pane_before = await tmux_manager.capture_pane(window_id)
@@ -108,44 +160,37 @@ async def _probe_transcript_command_error(
     provider: AgentProvider,
     transcript_path: str | None,
     since_offset: int | None,
+    cc_slash: str | None = None,
 ) -> str | None:
     """Return first command-like error line found in transcript delta."""
     if not transcript_path or since_offset is None:
         return None
 
-    def _read_incremental_entries(path: str, offset: int) -> list[dict]:
-        entries: list[dict] = []
-        with Path(path).open("r", encoding="utf-8") as fh:
-            fh.seek(offset)
-            for line in fh:
-                parsed = provider.parse_transcript_line(line)
-                if parsed:
-                    entries.append(parsed)
-        return entries
-
     try:
-        if provider.capabilities.supports_incremental_read:
-            entries = await asyncio.to_thread(
-                _read_incremental_entries,
-                transcript_path,
-                since_offset,
-            )
-        else:
-            entries, _ = await asyncio.to_thread(
-                provider.read_transcript_file,
-                transcript_path,
-                since_offset,
-            )
+        entries = await asyncio.to_thread(
+            read_entries, Path(transcript_path), provider.capabilities.name
+        )
+        entries = [entry for entry in entries if entry.offset >= since_offset]
     except OSError, NotImplementedError:
         return None
 
-    messages, _ = provider.parse_transcript_entries(entries, pending_tools={})
-    for msg in messages:
-        if msg.role != "assistant":
+    records, _ = parse_records(
+        entries,
+        provider.capabilities.name,
+        deduplicate_updates=True,
+    )
+    for _, record in records:
+        if record.role != "agent":
             continue
-        found = _extract_probe_error_line(msg.text)
-        if found:
-            return found
+        for part in record.parts:
+            if part.get("type") not in {"text", "notice"}:
+                continue
+            text = part.get("text")
+            if not isinstance(text, str):
+                continue
+            found = _extract_probe_error_line(text, cc_slash)
+            if found:
+                return found
     return None
 
 
@@ -167,11 +212,12 @@ async def _maybe_send_command_failure_message(
         provider,
         transcript_path,
         since_offset,
+        cc_slash,
     )
     if not error_line:
         pane_after = await tmux_manager.capture_pane(window_id)
         pane_delta = _extract_pane_delta(pane_before, pane_after)
-        error_line = _extract_probe_error_line(pane_delta)
+        error_line = _extract_probe_error_line(pane_delta, cc_slash)
     if error_line:
         await safe_reply(
             message,

@@ -5,7 +5,7 @@ live view ticking, and state pruning.
 
 Key components:
   - run_periodic_tasks: time-gated live view tick and topic check
-  - run_lifecycle_tasks: per-tick autoclose and unbound window management
+  - run_lifecycle_tasks: per-tick unbound window management
 """
 
 import time
@@ -16,10 +16,13 @@ import structlog
 from ...config import config
 from ...telegram_client import TelegramClient
 from ...utils import log_throttle_sweep
+from ...session_protocol.telegram import TelegramSessionAdapter
 from ..live.live_view import tick_live_views
+from .delivery_watch import check_delivery_wedges
+from ..topics.topic_deletion import cleanup_retired_topics
+from ..topics.topic_provisioning_recovery import recover_topic_provisioning
 from ..topics.topic_lifecycle import (
     check_agentless_topics,
-    check_autoclose_timers,
     check_unbound_window_ttl,
     probe_topic_existence,
     prune_stale_state,
@@ -44,6 +47,7 @@ async def run_periodic_tasks(
     client: TelegramClient,
     all_windows: list["TmuxWindow"],
     timers: dict[str, float],
+    adapter: TelegramSessionAdapter,
 ) -> None:
     """Run time-gated periodic tasks (topic check, live view, name sync)."""
     now = time.monotonic()
@@ -61,15 +65,34 @@ async def run_periodic_tasks(
 
     if now - timers["topic_check"] >= TOPIC_CHECK_INTERVAL:
         timers["topic_check"] = now
+        recovery = await recover_topic_provisioning(client, adapter=adapter)
         await prune_stale_state(all_windows)
-        await probe_topic_existence(client)
+        if not recovery.get("rate_limited"):
+            await probe_topic_existence(client, adapter)
+            # The drain retries failed deletions from ANY retire path
+            # (explicit unbind --delete, failed provisioning, system
+            # replacement), not only dead-session retention. With the
+            # knob off it still skips records the AUTOMATIC dead-session
+            # path left behind (reason dead_session): the operator
+            # turned that deletion off, and those topics stay.
+            await cleanup_retired_topics(
+                client,
+                exclude_reasons=(
+                    None
+                    if config.autodelete_dead_topics
+                    else frozenset({"dead_session"})
+                ),
+            )
         log_throttle_sweep()
+        # Last in the block so a raise here cannot skip the peers.
+        await check_delivery_wedges(client)
 
 
 async def run_lifecycle_tasks(
-    client: TelegramClient, all_windows: list["TmuxWindow"]
+    client: TelegramClient,
+    all_windows: list["TmuxWindow"],
+    adapter: TelegramSessionAdapter,
 ) -> None:
-    """Run per-tick lifecycle tasks (autoclose timers, unbound window TTL)."""
-    await check_autoclose_timers(client)
+    """Run per-tick lifecycle tasks (agentless topics, unbound window TTL)."""
     await check_agentless_topics(client, all_windows)
-    await check_unbound_window_ttl(all_windows)
+    await check_unbound_window_ttl(all_windows, adapter=adapter)

@@ -1,7 +1,7 @@
-"""Topic lifecycle management — autoclose timers, unbound window TTL, probing.
+"""Topic lifecycle management — unbound window TTL and topic probing.
 
 Periodic tasks that manage topic and window lifecycle:
-  - Autoclose: expire done/dead topics after configurable timeout
+  - Autoclose: expire done topics after configurable timeout
   - Unbound window TTL: kill orphaned tmux windows without topic bindings
   - Topic existence probing: detect deleted Telegram topics via API
   - State pruning: sync display names and remove stale entries
@@ -33,7 +33,7 @@ from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from ..callback_tokens import revoke_window_tokens
 from ..cleanup import clear_topic_state
 from ...telegram_rate_limiter import NO_RETRY_RATE_LIMIT_ARGS, retry_after_seconds
-from ..messaging_pipeline.message_sender import is_thread_gone
+from ...session_protocol.telegram import TelegramSessionAdapter, adapter_for
 from ..polling.polling_state import (
     lifecycle_strategy,
     terminal_poll_state,
@@ -62,122 +62,13 @@ def rollback_legacy_herdr_binding(user_id: int, thread_id: int, window_id: str) 
     return True
 
 
-# ── Autoclose timer management ────────────────────────────────────────────
-
-
-async def check_autoclose_timers(client: TelegramClient) -> None:
-    """Close topics whose done/dead timers have expired."""
-    all_topics = lifecycle_strategy.iter_topic_states()
-    if not all_topics:
-        return
-
-    now = time.monotonic()
-    expired: list[tuple[int, int, str]] = []
-    for user_id, thread_id, ts in all_topics:
-        if ts.autoclose is None:
-            continue
-        state, entered_at = ts.autoclose
-        if state == "done":
-            timeout = config.autoclose_done_minutes * 60
-        elif state == "dead":
-            timeout = config.autoclose_dead_minutes * 60
-        else:
-            continue
-        if timeout > 0 and now - entered_at >= timeout:
-            expired.append((user_id, thread_id, state))
-
-    for user_id, thread_id, state in expired:
-        await _close_expired_topic(client, user_id, thread_id, state)
-
-
-async def _close_expired_topic(
-    client: TelegramClient, user_id: int, thread_id: int, state: str
-) -> None:
-    """Attempt to close/delete an expired topic and clean up state."""
-    # Pick chat_id from bindings if exactly one candidate exists.
-    candidates = [
-        (chat_id, wid)
-        for uid, chat_id, tid, wid in thread_router.iter_thread_bindings_with_chat()
-        if uid == user_id and tid == thread_id
-    ]
-    scoped_chat_id = candidates[0][0] if len(candidates) == 1 else None
-    window_id = (
-        thread_router.get_window_for_thread(user_id, thread_id, scoped_chat_id)
-        if scoped_chat_id is not None
-        else thread_router.get_window_for_thread(user_id, thread_id)
-    )
-    if state == "dead" and window_id is not None:
-        # Tri-state, read here instead of through find_window_by_id: that
-        # answers None both for a window that is gone and for a backend that
-        # could not be reached, and this path closes the user's topic. Present
-        # clears the stale timer, unknown defers to the next expiry.
-        # Lazy: importing the reconciliation seam at module load forms a cycle.
-        from ...multiplexer.reconciliation import window_presence
-
-        present = await window_presence(window_id, tmux_manager)
-        if present is None:
-            logger.warning(
-                "stale_dead_autoclose_deferred",
-                thread_id=thread_id,
-                user_id=user_id,
-                window_id=window_id,
-            )
-            return
-        if present:
-            lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
-            logger.info(
-                "stale_dead_autoclose_cleared",
-                thread_id=thread_id,
-                user_id=user_id,
-                window_id=window_id,
-            )
-            return
-
-    chat_id = scoped_chat_id or thread_router.resolve_chat_id(user_id, thread_id)
-    # Reaching here with state "dead" means the window is confirmed gone (or
-    # was never bound), so an opted-in delete cannot take a live window's topic.
-    removed = False
-    if state == "dead" and config.delete_dead_topics:
-        removed = await _remove_topic(client, chat_id, thread_id, delete=True)
-    if not removed:
-        removed = await _remove_topic(client, chat_id, thread_id, delete=False)
-    if removed:
-        lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
-        logger.info(
-            "auto_closed_topic", chat_id=chat_id, thread_id=thread_id, user_id=user_id
-        )
-        cleanup_kwargs: dict = {"window_id": window_id, "window_dead": True}
-        if scoped_chat_id is not None:
-            cleanup_kwargs["chat_id"] = scoped_chat_id
-        await clear_topic_state(user_id, thread_id, client=client, **cleanup_kwargs)
-        thread_router.unbind_thread(
-            user_id,
-            thread_id,
-            retirement_reason="remote_closed",
-        )
-
-
-async def _remove_topic(
-    client: TelegramClient, chat_id: int, thread_id: int, *, delete: bool
-) -> bool:
-    """Delete or close a topic; True when it is gone or closed."""
-    remove = client.delete_forum_topic if delete else client.close_forum_topic
-    try:
-        await remove(chat_id=chat_id, message_thread_id=thread_id)
-    except TelegramError as e:
-        if is_thread_gone(e):
-            return True
-        event = "autodelete_failed" if delete else "autoclose_failed"
-        logger.debug(event, thread_id=thread_id, error=str(e))
-        return False
-    return True
-
-
 # ── Agentless topics ─────────────────────────────────────────────────────
 
 # (user_id, thread_id) -> monotonic time the bound window was first seen
 # without an agent. In memory only: a restart restarts the grace period.
 _agentless_since: dict[tuple[int, int], float] = {}
+
+AGENTLESS_RETIREMENT_REASON = "agentless"
 
 
 async def _agent_window_ids() -> set[str] | None:
@@ -195,11 +86,13 @@ async def check_agentless_topics(
 ) -> None:
     """Delete the topic of a live window whose agent has been gone too long.
 
-    The dead autoclose never fires for such a window: its timer clears itself
-    because the window is present. The session_map entry the agent hook keeps
-    is the liveness signal; pane commands are not (Claude reports a version
-    string). A window missing from the listing is left to the dead path, and
-    an unreadable session_map defers the whole sweep.
+    Dead-session cleanup never covers such a window: the window is present.
+    The session_map entry the agent hook keeps is the liveness signal; pane
+    commands are not (Claude reports a version string). A window missing from
+    the listing is left to the dead-session path, and an unreadable
+    session_map defers the whole sweep. Deletion goes through
+    ``retire_topic_binding``, so a failed delete is retried by the retired
+    topic drain like any other retirement.
     """
     grace = config.agentless_topic_minutes * 60
     if grace <= 0:
@@ -210,7 +103,7 @@ async def check_agentless_topics(
     live = {canonical_window_id(w.window_id) for w in all_windows}
     now = time.monotonic()
     bound: set[tuple[int, int]] = set()
-    expired: list[tuple[int, int | None, int, str]] = []
+    expired: list[tuple[int, int, int, str]] = []
     for user_id, chat_id, thread_id, window_id in list(
         thread_router.iter_thread_bindings_with_chat()
     ):
@@ -221,26 +114,19 @@ async def check_agentless_topics(
             _agentless_since.pop(key, None)
             continue
         since = _agentless_since.setdefault(key, now)
-        if now - since >= grace:
+        if now - since >= grace and chat_id is not None:
             expired.append((user_id, chat_id, thread_id, window_id))
     for key in set(_agentless_since) - bound:
         del _agentless_since[key]
 
-    for user_id, scoped_chat_id, thread_id, window_id in expired:
-        chat_id = scoped_chat_id or thread_router.resolve_chat_id(user_id, thread_id)
-        removed = await _remove_topic(client, chat_id, thread_id, delete=True)
-        if not removed:
-            removed = await _remove_topic(client, chat_id, thread_id, delete=False)
-        if not removed:
-            continue
-        _agentless_since.pop((user_id, thread_id), None)
-        logger.info(
-            "agentless_topic_removed",
-            chat_id=chat_id,
-            thread_id=thread_id,
-            user_id=user_id,
-            window_id=window_id,
-        )
+    for user_id, chat_id, thread_id, window_id in expired:
+        await _retire_agentless_topic(client, user_id, chat_id, thread_id, window_id)
+
+
+async def _retire_agentless_topic(
+    client: TelegramClient, user_id: int, chat_id: int, thread_id: int, window_id: str
+) -> None:
+    async def clear_state_before_delete() -> None:
         await clear_topic_state(
             user_id,
             thread_id,
@@ -249,9 +135,30 @@ async def check_agentless_topics(
             chat_id=chat_id,
             window_dead=False,
         )
-        thread_router.unbind_thread(
-            user_id, thread_id, chat_id=chat_id, retirement_reason="remote_closed"
-        )
+
+    # Lazy: topic_deletion imports the messaging pipeline, which imports
+    # this module's package at load.
+    from .topic_deletion import retire_topic_binding
+
+    outcome = await retire_topic_binding(
+        client,
+        user_id,
+        thread_id,
+        window_id,
+        chat_id=chat_id,
+        before_delete=clear_state_before_delete,
+        retirement_reason=AGENTLESS_RETIREMENT_REASON,
+    )
+    if not outcome.startswith("protected"):
+        _agentless_since.pop((user_id, thread_id), None)
+    logger.info(
+        "agentless_topic_retired",
+        chat_id=chat_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        window_id=window_id,
+        outcome=outcome,
+    )
 
 
 # ── Unbound window TTL ────────────────────────────────────────────────────
@@ -259,9 +166,11 @@ async def check_agentless_topics(
 
 async def check_unbound_window_ttl(
     live_windows: "list[TmuxWindow] | None" = None,
+    *,
+    adapter: TelegramSessionAdapter,
 ) -> None:
     """Kill unbound tmux windows whose TTL has expired."""
-    timeout = config.autoclose_done_minutes * 60
+    timeout = config.unbound_window_ttl_minutes * 60
     if timeout <= 0:
         return
 
@@ -289,15 +198,18 @@ async def check_unbound_window_ttl(
         if ws.unbound_timer is None:
             terminal_poll_state.set_unbound_timer(w.window_id, now)
 
-    await _kill_expired_unbound(now, timeout)
+    await _kill_expired_unbound(now, timeout, adapter)
     _prune_orphaned_poll_state(live_lookup, bound_lookup)
 
 
-async def _kill_expired_unbound(now: float, timeout: float) -> None:
+async def _kill_expired_unbound(
+    now: float, timeout: float, adapter: TelegramSessionAdapter
+) -> None:
     """Find and kill unbound windows past their TTL."""
     expired = terminal_poll_state.get_expired_unbound(now, timeout)
     for wid in expired:
-        if not await tmux_manager.kill_window(wid):
+        success, _ = await adapter.close(wid)
+        if not success:
             logger.warning("auto_kill_unbound_window_failed", window_id=wid)
             continue
 
@@ -432,14 +344,14 @@ async def _unbind_deleted_topic(
     chat_id: int | None,
     thread_id: int,
     wid: str,
+    adapter: TelegramSessionAdapter,
 ) -> None:
     """Tear down a window whose Telegram topic no longer exists."""
     w = await tmux_manager.find_window_by_id(wid)
     view = window_query.view_window(wid)
     killed = False
     if w and view and view.origin == CCGRAM_CREATED_WINDOW_ORIGIN:
-        await tmux_manager.kill_window(w.window_id)
-        killed = True
+        killed, _ = await adapter.close(w.window_id)
     terminal_poll_state.reset_probe_failures(wid)
     await clear_topic_state(user_id, thread_id, client, window_id=wid, chat_id=chat_id)
     thread_router.unbind_thread(
@@ -457,7 +369,9 @@ async def _unbind_deleted_topic(
     )
 
 
-async def probe_topic_existence(client: TelegramClient) -> None:
+async def probe_topic_existence(
+    client: TelegramClient, adapter: TelegramSessionAdapter
+) -> None:
     """Probe a slice of bound topics via Telegram API; detect deleted topics."""
     now = time.monotonic()
 
@@ -486,7 +400,9 @@ async def probe_topic_existence(client: TelegramClient) -> None:
                 "Topic_id_invalid" in e.message
                 or "thread not found" in e.message.lower()
             ):
-                await _unbind_deleted_topic(client, user_id, chat_id, thread_id, wid)
+                await _unbind_deleted_topic(
+                    client, user_id, chat_id, thread_id, wid, adapter
+                )
             elif isinstance(e, BadRequest) and "not enough rights" in e.message.lower():
                 _probe_pin_disabled.add(wid)
                 logger.info(
@@ -530,7 +446,7 @@ async def topic_closed_handler(
 
     The window becomes "unbound" and is available for rebinding via the window
     picker when a new topic is created. Unbound windows are auto-killed after
-    the configured TTL (autoclose_done_minutes) by the status polling loop.
+    the configured TTL by the status polling loop.
     """
     user = update.effective_user
     if not user or not config.is_user_allowed(user.id):
@@ -588,7 +504,7 @@ async def topic_closed_handler(
 
 
 async def topic_edited_handler(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle topic rename — sync new name to tmux window and emoji cache.
 
@@ -637,7 +553,7 @@ async def topic_edited_handler(
         )
         return
 
-    renamed = await tmux_manager.rename_window(window_id, clean_name)
+    renamed, _ = await adapter_for(context.bot_data).rename(window_id, clean_name)
     if renamed:
         session_manager.set_display_name(window_id, clean_name)
         update_stored_topic_name(chat_id, thread_id, clean_name)

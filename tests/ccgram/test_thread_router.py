@@ -1,6 +1,33 @@
+import uuid
+
 import pytest
 
-from ccgram.thread_router import _RETIRED_TOPIC_LIMIT, ThreadRouter
+from ccgram.thread_router import RetiredTopic, _RETIRED_TOPIC_LIMIT, ThreadRouter
+
+
+def test_observed_chat_cannot_claim_an_unknown_legacy_topic(router):
+    router.bind_thread(100, 42, "@old")
+    before = router.to_dict()
+    router.set_group_chat_id(100, 42, -999)
+    assert router.to_dict() == before
+    assert list(router.iter_thread_bindings_with_chat()) == [(100, None, 42, "@old")]
+
+
+def test_observed_chat_cannot_replace_recorded_legacy_chat(router):
+    router.bind_thread(100, 42, "@old")
+    router.group_chat_ids["100:42"] = -111
+    before = router.to_dict()
+    router.set_group_chat_id(100, 42, -999)
+    assert router.to_dict() == before
+    assert list(router.iter_thread_bindings_with_chat()) == [(100, -111, 42, "@old")]
+
+
+def test_matching_recorded_chat_can_promote_legacy_binding(router):
+    router.bind_thread(100, 42, "@old")
+    router.group_chat_ids["100:42"] = -999
+    router.set_group_chat_id(100, 42, -999)
+    assert router.get_window_for_thread(100, 42, -999) == "@old"
+    assert router.thread_bindings == {}
 
 
 @pytest.fixture
@@ -34,6 +61,23 @@ class TestBindThread:
         router.bind_thread(100, 1, "@1")
         router.bind_thread(100, 1, "@2")
         assert router.get_window_for_thread(100, 1) == "@2"
+
+
+@pytest.mark.parametrize("chat_id", [None, -999])
+def test_rebinding_retained_window_preserves_pinned_name(chat_id: int | None) -> None:
+    router = ThreadRouter(
+        schedule_save=lambda: None, has_window_state=lambda _wid: True
+    )
+    router.bind_thread(100, 1, "@1", window_name="backend-name", chat_id=chat_id)
+    router.set_display_name("@1", "user-name", pin=True)
+
+    assert router.unbind_thread(100, 1, chat_id=chat_id) == "@1"
+    router.bind_thread(100, 2, "@1", window_name="changed-backend", chat_id=chat_id)
+
+    assert router.get_window_for_thread(100, 2, chat_id=chat_id) == "@1"
+    assert router.get_display_name("@1") == "user-name"
+    assert router.pinned_display_names == {"@1"}
+    assert router.sync_display_names([("@1", "changed-backend")]) is False
 
 
 class TestUnbindThread:
@@ -84,6 +128,56 @@ class TestRetiredTopics:
         assert retired[0].thread_id == 42
         assert retired[0].reason == "system_replacement"
         assert retired[0].cleanup_eligible is True
+        assert retired[0].retry_at == 0.0
+        assert retired[0].closed is False
+
+    def test_updates_retry_state_and_round_trips(self, router: ThreadRouter) -> None:
+        router.bind_thread(100, 42, "@1", chat_id=-999)
+        router.unbind_thread(
+            100,
+            42,
+            chat_id=-999,
+            retirement_reason="system_replacement",
+            cleanup_eligible=True,
+        )
+        topic = next(router.iter_retired_topics())
+
+        updated = router.update_retired_topic(
+            topic,
+            retry_at=123.5,
+            closed=True,
+        )
+
+        assert updated is not None
+        assert updated.retry_at == 123.5
+        assert updated.closed is True
+        assert updated.cleanup_eligible is True
+
+        restored = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+        )
+        restored.from_dict(router.to_dict())
+
+        assert list(restored.iter_retired_topics()) == [updated]
+
+    def test_stale_update_after_rebind_is_discarded(self, router: ThreadRouter) -> None:
+        router.bind_thread(100, 42, "@1", chat_id=-999)
+        router.unbind_thread(
+            100,
+            42,
+            chat_id=-999,
+            retirement_reason="system_replacement",
+            cleanup_eligible=True,
+        )
+        topic = next(router.iter_retired_topics())
+        router.bind_thread(100, 42, "@2", chat_id=-999)
+
+        saves: list[int] = []
+        router._schedule_save = lambda: saves.append(1)
+        assert router.update_retired_topic(topic, retry_at=123.5, closed=True) is None
+        assert list(router.iter_retired_topics()) == []
+        assert saves == []
 
     def test_restart_discards_record_for_an_active_rebound_topic(
         self, router: ThreadRouter
@@ -140,14 +234,96 @@ class TestRetiredTopics:
                 100,
                 thread_id,
                 chat_id=-999,
-                retirement_reason="system_replacement",
-                cleanup_eligible=True,
+                retirement_reason="keep_remote",
             )
 
         retired = list(router.iter_retired_topics())
         assert len(retired) == _RETIRED_TOPIC_LIMIT
         assert retired[0].thread_id == 3
         assert retired[-1].thread_id == _RETIRED_TOPIC_LIMIT + 2
+
+    def test_pending_topics_survive_insertion_and_serialization(
+        self, router: ThreadRouter
+    ) -> None:
+        for thread_id in range(1, _RETIRED_TOPIC_LIMIT + 6):
+            router.bind_thread(100, thread_id, f"@{thread_id}", chat_id=-999)
+            router.unbind_thread(
+                100,
+                thread_id,
+                chat_id=-999,
+                retirement_reason="system_replacement",
+                cleanup_eligible=True,
+            )
+
+        restored = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+        )
+        restored.from_dict(router.to_dict())
+
+        retired = list(restored.iter_retired_topics())
+        assert len(retired) == _RETIRED_TOPIC_LIMIT + 5
+        assert [topic.thread_id for topic in retired] == list(
+            range(1, _RETIRED_TOPIC_LIMIT + 6)
+        )
+
+    def test_load_retains_pending_topics_and_newest_history(
+        self, router: ThreadRouter
+    ) -> None:
+        raw_topics = [
+            {
+                "user_id": 100,
+                "chat_id": -999,
+                "thread_id": thread_id,
+                "reason": "keep_remote",
+                "cleanup_eligible": thread_id % 2 == 0,
+                "sequence": thread_id,
+            }
+            for thread_id in range(1, 2 * _RETIRED_TOPIC_LIMIT + 6)
+        ]
+
+        router.from_dict({"retired_topics": raw_topics})
+
+        retired = list(router.iter_retired_topics())
+        assert [topic.thread_id for topic in retired] == [
+            thread_id
+            for thread_id in range(1, 2 * _RETIRED_TOPIC_LIMIT + 6)
+            if thread_id % 2 == 0 or thread_id >= 7
+        ]
+
+    def test_load_rejects_invalid_retry_and_closed_values(
+        self, router: ThreadRouter
+    ) -> None:
+        def raw_topic(**overrides: object) -> dict[str, object]:
+            topic: dict[str, object] = {
+                "user_id": 100,
+                "chat_id": -999,
+                "thread_id": 42,
+                "reason": "system_replacement",
+                "cleanup_eligible": True,
+                "sequence": 1,
+                "retry_at": 0.0,
+                "closed": False,
+            }
+            topic.update(overrides)
+            return topic
+
+        router.from_dict(
+            {
+                "retired_topics": [
+                    raw_topic(retry_at=-1.0),
+                    raw_topic(retry_at=float("inf"), sequence=2),
+                    raw_topic(retry_at=float("nan"), sequence=3),
+                    raw_topic(closed=1, sequence=4),
+                    raw_topic(sequence=5),
+                ]
+            }
+        )
+
+        retired = list(router.iter_retired_topics())
+        assert [
+            (topic.sequence, topic.retry_at, topic.closed) for topic in retired
+        ] == [(5, 0.0, False)]
 
     def test_chatless_binding_is_not_treated_as_a_known_forum_topic(
         self, router: ThreadRouter
@@ -156,6 +332,402 @@ class TestRetiredTopics:
         router.unbind_thread(100, 42, cleanup_eligible=True)
 
         assert list(router.iter_retired_topics()) == []
+
+
+class TestTopicDeletionClaims:
+    @staticmethod
+    def _retire(router: ThreadRouter) -> RetiredTopic:
+        router.bind_thread(100, 42, "@old", chat_id=-999)
+        router.unbind_thread(
+            100,
+            42,
+            chat_id=-999,
+            retirement_reason="system_replacement",
+            cleanup_eligible=True,
+        )
+        return next(router.iter_retired_topics())
+
+    def test_has_active_topic_checks_all_users(self, router: ThreadRouter) -> None:
+        router.bind_thread(100, 42, "@1", chat_id=-999)
+        router.bind_thread(200, 42, "@2", chat_id=-999)
+
+        assert router.has_active_topic(-999, 42) is True
+        assert router.has_active_topic(-998, 42) is False
+
+    def test_has_active_topic_resolves_legacy_chat_metadata(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 42, "@1")
+        router.group_chat_ids["100:42"] = -999
+
+        assert router.has_active_topic(-999, 42) is True
+
+    def test_begin_claim_rejects_bind_without_mutating_route(
+        self, router: ThreadRouter
+    ) -> None:
+        topic = self._retire(router)
+        assert router.begin_topic_deletion(topic) is True
+
+        with pytest.raises(
+            ValueError,
+            match="Topic deletion is in progress; retry with a new topic",
+        ):
+            router.bind_thread(200, 42, "@new", chat_id=-999)
+
+        assert router.get_window_for_chat_thread(-999, 42) is None
+        assert list(router.iter_retired_topics()) == [topic]
+
+    def test_duplicate_claim_is_rejected_and_release_allows_bind(
+        self, router: ThreadRouter
+    ) -> None:
+        topic = self._retire(router)
+        assert router.begin_topic_deletion(topic) is True
+        assert router.begin_topic_deletion(topic) is False
+
+        router.end_topic_deletion(topic)
+        router.bind_thread(100, 42, "@new", chat_id=-999)
+
+        assert router.get_window_for_chat_thread(-999, 42) == "@new"
+
+    def test_stale_record_cannot_be_claimed_after_rebind(
+        self, router: ThreadRouter
+    ) -> None:
+        topic = self._retire(router)
+        router.bind_thread(100, 42, "@new", chat_id=-999)
+
+        assert router.begin_topic_deletion(topic) is False
+
+    def test_reset_releases_topic_deletion_claim(self, router: ThreadRouter) -> None:
+        topic = self._retire(router)
+        assert router.begin_topic_deletion(topic) is True
+
+        router.reset()
+        router.from_dict(
+            {
+                "retired_topics": [
+                    {
+                        "user_id": topic.user_id,
+                        "chat_id": topic.chat_id,
+                        "thread_id": topic.thread_id,
+                        "reason": topic.reason,
+                        "cleanup_eligible": topic.cleanup_eligible,
+                        "sequence": topic.sequence,
+                    }
+                ]
+            }
+        )
+
+        assert router.begin_topic_deletion(topic) is True
+
+
+class TestTopicProvisioning:
+    def test_begin_is_durable_and_owned(self, router: ThreadRouter) -> None:
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            target_id="target-1",
+            kind="topic_for_target",
+        )
+
+        assert claim.thread_id is None
+        assert claim.target_id == "target-1"
+        assert router.iter_topic_provisionings() == [claim]
+        assert router.owns_topic_provisioning(claim.claim_id) is True
+        assert router.to_dict()["topic_provisioning"] == [
+            {
+                "claim_id": claim.claim_id,
+                "user_id": 100,
+                "chat_id": -999,
+                "thread_id": None,
+                "target_id": "target-1",
+                "previous_target_id": None,
+                "kind": "topic_for_target",
+                "uncertain": False,
+                "created_at": claim.created_at,
+                "retry_thread_id": None,
+                "retry_at": 0.0,
+            }
+        ]
+
+    def test_attach_supersedes_target_and_commit_binds_atomically(
+        self, router: ThreadRouter
+    ) -> None:
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            target_id="provisional",
+            kind="replacement",
+        )
+        claim = router.attach_provisioning_target(claim.claim_id, "durable")
+        claim = router.attach_provisioning_topic(claim.claim_id, 42)
+
+        assert claim.previous_target_id == "provisional"
+        assert router.commit_topic_provisioning(claim.claim_id, window_name="proj")
+        assert router.get_window_for_chat_thread(-999, 42) == "durable"
+        assert router.get_display_name("durable") == "proj"
+        assert router.iter_topic_provisionings() == []
+        assert router.owns_topic_provisioning(claim.claim_id) is False
+
+    def test_regular_bind_is_rejected_until_commit(self, router: ThreadRouter) -> None:
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            thread_id=42,
+            target_id="durable",
+            kind="target_for_topic",
+        )
+
+        with pytest.raises(ValueError, match="provisioning is in progress"):
+            router.bind_thread(100, 42, "other", chat_id=-999)
+
+        assert router.commit_topic_provisioning(claim.claim_id) is True
+        assert router.get_window_for_chat_thread(-999, 42) == "durable"
+
+    def test_other_user_cannot_bind_claimed_topic(self, router: ThreadRouter) -> None:
+        router.begin_topic_provisioning(
+            100,
+            -999,
+            thread_id=42,
+            target_id="durable",
+            kind="target_for_topic",
+        )
+
+        with pytest.raises(ValueError, match="provisioning is in progress"):
+            router.bind_thread(200, 42, "other", chat_id=-999)
+
+    def test_abort_retires_only_an_unbound_topic(self, router: ThreadRouter) -> None:
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            thread_id=42,
+            target_id="durable",
+            kind="target_for_topic",
+        )
+        aborted = router.abort_topic_provisioning(
+            claim.claim_id, target_confirmed_absent=True
+        )
+
+        assert aborted == claim
+        assert router.iter_topic_provisionings() == []
+        retired = list(router.iter_retired_topics())
+        assert len(retired) == 1
+        assert retired[0].reason == "creation_failed"
+        assert retired[0].cleanup_eligible is True
+
+    def test_retired_topic_keeps_target_for_deletion_race(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 42, "durable", chat_id=-999)
+        router.unbind_thread(
+            100,
+            42,
+            chat_id=-999,
+            retirement_reason="system_replacement",
+            cleanup_eligible=True,
+        )
+        topic = next(router.iter_retired_topics())
+
+        assert topic.target_id == "durable"
+        assert router.begin_topic_deletion(topic) is True
+        with pytest.raises(ValueError, match="deletion is in progress"):
+            router.begin_topic_provisioning(
+                100,
+                -999,
+                target_id="durable",
+                kind="topic_for_target",
+            )
+
+        router.end_topic_deletion(topic)
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            target_id="durable",
+            kind="topic_for_target",
+        )
+        router.abort_topic_provisioning(
+            claim.claim_id,
+            target_confirmed_absent=False,
+            topic_confirmed_absent=True,
+        )
+
+    def test_attach_and_commit_reject_target_or_topic_under_deletion(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 42, "durable", chat_id=-999)
+        router.unbind_thread(
+            100,
+            42,
+            chat_id=-999,
+            retirement_reason="system_replacement",
+            cleanup_eligible=True,
+        )
+        topic = next(router.iter_retired_topics())
+        assert router.begin_topic_deletion(topic) is True
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            target_id="new-target",
+            kind="replacement",
+        )
+
+        with pytest.raises(ValueError, match="deletion is in progress"):
+            router.attach_provisioning_target(claim.claim_id, "durable")
+        with pytest.raises(ValueError, match="deletion is in progress"):
+            router.attach_provisioning_topic(claim.claim_id, 42)
+
+        router.end_topic_deletion(topic)
+        router.attach_provisioning_target(claim.claim_id, "durable")
+        router.attach_provisioning_topic(claim.claim_id, 42)
+        assert router.commit_topic_provisioning(claim.claim_id) is True
+
+    def test_abort_preserves_old_binding_and_ambiguous_claim(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 42, "old", chat_id=-999)
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            thread_id=42,
+            target_id="new",
+            kind="replacement",
+        )
+
+        uncertain = router.abort_topic_provisioning(
+            claim.claim_id, target_confirmed_absent=False
+        )
+
+        assert uncertain is not None and uncertain.uncertain is True
+        assert router.owns_topic_provisioning(claim.claim_id) is True
+        assert router.get_window_for_chat_thread(-999, 42) == "old"
+        assert list(router.iter_retired_topics()) == []
+
+        router.mark_provisioning_uncertain(claim.claim_id)
+        assert router.owns_topic_provisioning(claim.claim_id) is False
+
+    def test_no_topic_failure_can_release_with_topic_absence_proof(
+        self, router: ThreadRouter
+    ) -> None:
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            target_id="live-target",
+            kind="topic_for_target",
+        )
+
+        assert (
+            router.abort_topic_provisioning(
+                claim.claim_id,
+                target_confirmed_absent=False,
+                topic_confirmed_absent=True,
+            )
+            == claim
+        )
+        assert router.iter_topic_provisionings() == []
+
+    def test_confirmed_absent_topic_unbinds_only_exact_binding(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 42, "dead", chat_id=-999)
+        router.bind_thread(100, 43, "keep", chat_id=-999)
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            thread_id=42,
+            target_id="replacement",
+            kind="replacement",
+        )
+
+        assert (
+            router.abort_topic_provisioning(
+                claim.claim_id,
+                target_confirmed_absent=False,
+                topic_confirmed_absent=True,
+            )
+            == claim
+        )
+        assert router.get_window_for_chat_thread(-999, 42) is None
+        assert router.get_window_for_chat_thread(-999, 43) == "keep"
+        assert list(router.iter_retired_topics()) == []
+
+    def test_prepare_and_defer_recreation_round_trip(
+        self, router: ThreadRouter
+    ) -> None:
+        router.bind_thread(100, 42, "dead", chat_id=-999)
+        claim = router.begin_topic_provisioning(
+            100,
+            -999,
+            thread_id=42,
+            target_id="live",
+            kind="replacement",
+        )
+
+        prepared = router.prepare_topic_recreation(claim.claim_id)
+        assert prepared.thread_id is None
+        assert prepared.retry_thread_id == 42
+        assert prepared.retry_at == 0.0
+        assert prepared.uncertain is True
+        assert router.owns_topic_provisioning(claim.claim_id) is True
+        assert router.get_window_for_chat_thread(-999, 42) is None
+        assert list(router.iter_retired_topics()) == []
+
+        deferred = router.defer_topic_recreation(
+            claim.claim_id,
+            retry_at=123.5,
+        )
+        assert deferred.retry_thread_id == 42
+        assert deferred.retry_at == 123.5
+        assert deferred.uncertain is False
+        assert router.owns_topic_provisioning(claim.claim_id) is False
+
+        restored = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+        )
+        restored.from_dict(router.to_dict())
+        loaded = restored.get_topic_provisioning(claim.claim_id)
+        assert loaded == deferred
+        assert restored.owns_topic_provisioning(claim.claim_id) is False
+
+    def test_multi_chat_claims_and_restart_have_no_ttl(
+        self, router: ThreadRouter
+    ) -> None:
+        first = router.begin_topic_provisioning(
+            100,
+            -1001,
+            thread_id=42,
+            target_id="target-a",
+            kind="target_for_topic",
+        )
+        second = router.begin_topic_provisioning(
+            100,
+            -1002,
+            thread_id=42,
+            target_id="target-b",
+            kind="target_for_topic",
+        )
+        raw = router.to_dict()
+        raw["topic_provisioning"].extend(
+            {
+                **entry,
+                "claim_id": str(uuid.uuid4()),
+                "thread_id": 1000 + index,
+                "target_id": f"old-{index}",
+                "created_at": 1.0,
+            }
+            for index, entry in enumerate(raw["topic_provisioning"] * 60)
+        )
+
+        restored = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+        )
+        restored.from_dict(raw)
+
+        assert restored.has_topic_provisioning(-1001, 42) is True
+        assert restored.has_topic_provisioning(-1002, 42) is True
+        assert len(restored.iter_topic_provisionings()) == 122
+        assert restored.owns_topic_provisioning(first.claim_id) is False
+        assert restored.owns_topic_provisioning(second.claim_id) is False
 
 
 class TestPrivateTopicChats:
@@ -260,8 +832,7 @@ class TestResolveChatId:
 
 class TestGetWindowForChatThread:
     def test_resolves_window(self, router: ThreadRouter) -> None:
-        router.bind_thread(100, 1, "@1")
-        router.set_group_chat_id(100, 1, -999)
+        router.bind_thread(100, 1, "@1", chat_id=-999)
         assert router.get_window_for_chat_thread(-999, 1) == "@1"
 
     def test_no_match(self, router: ThreadRouter) -> None:
@@ -279,6 +850,24 @@ class TestDisplayNames:
     def test_set_and_get(self, router: ThreadRouter) -> None:
         router.set_display_name("@1", "myproject")
         assert router.get_display_name("@1") == "myproject"
+
+    def test_non_pinning_set_preserves_pinned_name_equal_to_window_id(
+        self, router: ThreadRouter
+    ) -> None:
+        router.set_display_name("@1", "@1", pin=True)
+
+        router.set_display_name("@1", "backend-name")
+
+        assert router.get_display_name("@1") == "@1"
+        assert router.pinned_display_names == {"@1"}
+
+    def test_pinning_set_can_update_an_existing_pin(self, router: ThreadRouter) -> None:
+        router.set_display_name("@1", "first-name", pin=True)
+
+        router.set_display_name("@1", "second-name", pin=True)
+
+        assert router.get_display_name("@1") == "second-name"
+        assert router.pinned_display_names == {"@1"}
 
     def test_sync_display_names(self, router: ThreadRouter) -> None:
         router.window_display_names["@1"] = "old-name"
@@ -298,9 +887,8 @@ class TestDisplayNames:
 
 class TestToDictRoundtrip:
     def test_roundtrip(self, router: ThreadRouter) -> None:
-        router.bind_thread(100, 1, "@1", window_name="proj")
+        router.bind_thread(100, 1, "@1", window_name="proj", chat_id=-999)
         router.bind_thread(200, 2, "@2")
-        router.set_group_chat_id(100, 1, -999)
 
         data = router.to_dict()
         new_router = ThreadRouter(
@@ -314,6 +902,21 @@ class TestToDictRoundtrip:
         assert new_router.resolve_chat_id(100, 1) == -999
         assert new_router.get_display_name("@1") == "proj"
         assert new_router.get_thread_for_window(100, "@1") == 1
+
+    def test_pinned_display_name_survives_reload_and_listing_sync(
+        self, router: ThreadRouter
+    ) -> None:
+        router.set_display_name("@1", "manual-name", pin=True)
+        restored = ThreadRouter(
+            schedule_save=lambda: None,
+            has_window_state=lambda _wid: False,
+        )
+
+        restored.from_dict(router.to_dict())
+
+        assert restored.pinned_display_names == {"@1"}
+        assert restored.sync_display_names([("@1", "backend-name")]) is False
+        assert restored.get_display_name("@1") == "manual-name"
 
     def test_from_dict_dedup(self, router: ThreadRouter) -> None:
         data = {
