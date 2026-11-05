@@ -1,7 +1,7 @@
 """Photo and document message handlers for forwarding files to Claude Code.
 
 Saves uploaded files to `.ccgram-uploads/` in the session's cwd, then sends
-Claude a natural-language message with the relative path so it can read the
+Claude a natural-language message with the absolute path so it can read the
 file via its Read tool.
 
 Key handlers:
@@ -12,6 +12,7 @@ Key handlers:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import contextlib
 import structlog
 import re
 import unicodedata
@@ -23,6 +24,7 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from ..config import config
 from ..telegram_client import PTBTelegramClient
+from ..session_protocol.telegram import adapter_for
 from ..window_query import view_window
 from .telegram_origin import send_telegram_to_window
 from ..thread_router import thread_router
@@ -45,6 +47,14 @@ _FILENAME_PUNCT = frozenset("._-")
 
 # Control characters to strip from captions (keep \n and \t)
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Control characters a path may never carry into a literal tmux send
+# (unlike captions, \n and \t are included; C1 controls like U+009B are
+# rejected because terminals execute them on echo). Legal nonprinting
+# Unicode such as a no-break space is not a control character and stays
+# allowed, which is why str.isprintable() is the wrong test here: it
+# rejects those legal names too.
+_PATH_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 _MAX_CAPTION_LEN = 500
 
@@ -144,7 +154,18 @@ def _resolve_upload_dir(
     if view is None or not view.cwd:
         return window_id, None, "Session has no working directory."
 
+    # The cwd arrives as an unvalidated passthrough (hook payload, persisted
+    # state), so enforce the absolute-path invariant here: every consumer of
+    # upload_path, the save location and the agent notification, depends on it.
+    # A tilde form is deliberately rejected rather than expanded: expansion
+    # would resolve against the bridge process's home, not the session owner's.
     upload_path = Path(view.cwd) / _UPLOAD_DIR
+    if not upload_path.is_absolute():
+        return window_id, None, "Session working directory is not absolute."
+    if _PATH_CONTROL_RE.search(str(upload_path)):
+        # A control character would split the literal tmux send; see
+        # _PATH_CONTROL_RE for the caption distinction.
+        return window_id, None, "Session working directory is not usable."
     return window_id, upload_path, None
 
 
@@ -214,6 +235,8 @@ async def _upload_and_notify(
     size_label: str,
     claude_msg_tpl: str,
     success_emoji: str,
+    *,
+    adapter,
 ) -> None:
     """Shared upload flow: resolve dir, download, notify Claude, reply to user."""
     window_id, upload_path, error = _resolve_upload_dir(
@@ -223,7 +246,9 @@ async def _upload_and_notify(
         await safe_reply(message, f"\u274c {error}")
         return
 
-    await message.chat.send_action(ChatAction.TYPING)
+    # Best-effort: a network error here must not drop the upload (#257).
+    with contextlib.suppress(TelegramError):
+        await message.chat.send_action(ChatAction.TYPING)
 
     saved_name = await _download_and_save(
         message, upload_path, filename, file_id, file_size, size_label
@@ -233,12 +258,20 @@ async def _upload_and_notify(
 
     rel_path = f"{_UPLOAD_DIR}/{saved_name}"
     caption = message.caption or ""
-    claude_msg = claude_msg_tpl.format(name=saved_name, path=rel_path)
+    # Absolute path in the agent message: an agent resolves a relative one
+    # against an arbitrary base (its home rather than the session cwd), and
+    # the failed read then looks like the upload never happened.
+    claude_msg = claude_msg_tpl.format(name=saved_name, path=upload_path / saved_name)
     if caption:
         claude_msg += f"\n\nUser note: {_sanitize_caption(caption)}"
 
     success, err = await send_telegram_to_window(
-        user_id, window_id, message.message_thread_id, claude_msg, message.chat.id
+        user_id,
+        window_id,
+        message.message_thread_id,
+        claude_msg,
+        message.chat.id,
+        adapter=adapter,
     )
     if success:
         await ack_reaction(
@@ -252,7 +285,7 @@ async def _upload_and_notify(
 
 
 async def handle_photo_message(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle photo uploads: save to .ccgram-uploads/ and notify Claude."""
     user = update.effective_user
@@ -274,11 +307,12 @@ async def handle_photo_message(
         "Photo",
         "I've uploaded an image to {path} — please take a look.",
         "\U0001f4f7",
+        adapter=adapter_for(context.bot_data),
     )
 
 
 async def handle_document_message(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle document uploads: save to .ccgram-uploads/ and notify Claude."""
     user = update.effective_user
@@ -300,4 +334,5 @@ async def handle_document_message(
         "File",
         "I've uploaded {name} to {path}",
         "\U0001f4ce",
+        adapter=adapter_for(context.bot_data),
     )

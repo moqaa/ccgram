@@ -1,26 +1,24 @@
-"""Claude Code provider — wraps existing modules behind AgentProvider protocol.
+"""Claude Code provider — terminal and lifecycle adapter behind AgentProvider.
 
-Delegates to hook.py, transcript_parser.py, terminal_parser.py, and
-cc_commands.py without changing any behavior. This is a thin adapter layer
-that translates between the provider protocol and existing module APIs.
+Transcript interpretation is shared in ``session_protocol.messages``.
+This provider handles Claude-specific launch, hook, status, and command behavior.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, cast
 
 import structlog
 
 from ccgram.cc_commands import CC_BUILTINS
 from ccgram.providers._resume import discover_claude_sessions
+from ccgram.providers.claude_tui import parse_claude_command_menu
 from ccgram.providers.base import UUID_RE
 from ccgram.providers.base import (
-    AgentMessage,
-    ContentType,
     DiscoveredCommand,
-    MessageRole,
+    FirstRunPrompt,
     ProviderCapabilities,
     ResumableSession,
     SessionStartEvent,
@@ -34,7 +32,6 @@ from ccgram.terminal_parser import (
     format_status_display,
     parse_status_block,
 )
-from ccgram.transcript_parser import TranscriptParser
 
 _log = structlog.get_logger(__name__)
 
@@ -117,7 +114,8 @@ class ClaudeProvider:
         # arrow keys, Enter, and Esc. Sourced from the v2.1.x docs page.
         tui_picker_commands=frozenset(
             {
-                "agents",
+                "config",
+                "help",
                 "copy",
                 "diff",
                 "effort",
@@ -130,6 +128,14 @@ class ClaudeProvider:
                 "theme",
                 "tui",
             }
+        ),
+        # Folder trust dialog: "Yes, proceed" is the default selection, so
+        # Enter clears it. Seeded in ~/.claude.json first; this covers a
+        # config path ccgram could not write.
+        first_run=FirstRunPrompt(
+            needles=("do you trust the files in this folder",),
+            keys=("Enter",),
+            settled=("bypass permissions", "for shortcuts"),
         ),
     )
 
@@ -164,49 +170,17 @@ class ClaudeProvider:
             limit=limit,
         )
 
-    def read_transcript_file(
-        self, file_path: str, last_offset: int
-    ) -> tuple[list[dict[str, Any]], int]:
-        """Claude uses incremental JSONL reading, not whole-file."""
-        msg = "ClaudeProvider uses incremental JSONL reading, not whole-file"
-        raise NotImplementedError(msg)
-
-    def parse_transcript_line(self, line: str) -> dict[str, Any] | None:
-        """Delegate to TranscriptParser.parse_line."""
-        return TranscriptParser.parse_line(line)
-
-    def parse_transcript_entries(
-        self,
-        entries: list[dict[str, Any]],
-        pending_tools: dict[str, Any],
-        cwd: str | None = None,
-    ) -> tuple[list[AgentMessage], dict[str, Any]]:
-        """Parse JSONL entries via TranscriptParser and wrap as AgentMessages."""
-        parsed, remaining = TranscriptParser.parse_entries(
-            entries, pending_tools, cwd=cwd
-        )
-
-        messages = [
-            AgentMessage(
-                text=e.text,
-                role=cast(MessageRole, e.role),
-                content_type=cast(ContentType, e.content_type),
-                tool_use_id=e.tool_use_id,
-                tool_name=e.tool_name,
-                timestamp=e.timestamp,
-            )
-            for e in parsed
-        ]
-
-        return messages, remaining
-
     def parse_terminal_status(
         self,
         pane_text: str,
         *,
         pane_title: str = "",  # noqa: ARG002
     ) -> StatusUpdate | None:
-        """Parse pane text; interactive UI takes precedence over status line."""
+        """Parse pane text; verified Claude command menus precede generic status."""
+        command_menu = parse_claude_command_menu(pane_text)
+        if command_menu:
+            return command_menu
+
         interactive = extract_interactive_content(pane_text)
         if interactive:
             return StatusUpdate(
@@ -214,6 +188,7 @@ class ClaudeProvider:
                 display_label=interactive.name,
                 is_interactive=True,
                 ui_type=interactive.name,
+                ui_advisory=interactive.advisory,
             )
 
         raw_status = parse_status_block(pane_text)
@@ -228,33 +203,6 @@ class ClaudeProvider:
 
     def extract_bash_output(self, pane_text: str, command: str) -> str | None:
         return extract_bash_output(pane_text, command)
-
-    def is_user_transcript_entry(self, entry: dict[str, Any]) -> bool:
-        return TranscriptParser.is_user_message(entry)
-
-    def parse_history_entry(self, entry: dict[str, Any]) -> AgentMessage | None:
-        """Parse a single transcript entry for history display."""
-        raw_role = entry.get("type", "assistant")
-        if raw_role not in ("user", "assistant"):
-            return None
-        parsed = TranscriptParser.parse_message(entry)
-        if parsed is None or not parsed.text:
-            return None
-        role = cast(MessageRole, raw_role)
-        # "user"/"assistant" message_type maps to "text"; others pass through.
-        raw_ct = (
-            "text"
-            if parsed.message_type in ("user", "assistant")
-            else parsed.message_type
-        )
-        content_type = cast(ContentType, raw_ct)
-        return AgentMessage(
-            text=parsed.text,
-            role=role,
-            content_type=content_type,
-            tool_name=parsed.tool_name,
-            timestamp=TranscriptParser.get_timestamp(entry),
-        )
 
     def requires_pane_title_for_detection(
         self,
@@ -340,23 +288,22 @@ class ClaudeProvider:
         transcript_path: str,
     ) -> None:
         """Seed Claude task-tracking state by reading the full transcript once."""
-        # Lazy: aiofiles is heavy; defer until the JSONL reader actually opens a file
-        import aiofiles
-
         # Lazy: claude_task_state ↔ claude provider cycle
         from ccgram.claude_task_state import claude_task_state
 
-        entries: list[dict] = []
+        # Lazy: keep transcript parsing out of the Claude provider import cycle.
+        from ccgram.session_protocol.messages import read_entries
+
         try:
-            async with aiofiles.open(transcript_path, "r", encoding="utf-8") as f:
-                async for line in f:
-                    data = self.parse_transcript_line(line)
-                    if data:
-                        entries.append(data)
+            entries = await asyncio.to_thread(
+                read_entries, Path(transcript_path), "claude"
+            )
         except OSError:
             _log.exception("seed_task_state: error reading %s", transcript_path)
             return
-        claude_task_state.rebuild_from_entries(window_id, session_id, entries)
+        claude_task_state.rebuild_from_entries(
+            window_id, session_id, [entry.data for entry in entries]
+        )
 
     def apply_task_entries(
         self,

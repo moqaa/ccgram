@@ -25,10 +25,12 @@ from ccgram.handlers.interactive.interactive_ui import (
     _build_interactive_keyboard,
     _interactive_mode,
     _interactive_msgs,
+    _interactive_panes,
     _lookup_pane_name,
     _send_cooldowns,
     clear_interactive_mode,
     format_interactive_message,
+    get_interactive_pane,
     get_interactive_window,
     handle_interactive_ui,
     INTERACTIVE_INSTRUCTION_LINE,
@@ -41,13 +43,18 @@ _UI = "ccgram.handlers.interactive.interactive_ui"
 
 
 @contextmanager
-def _interactive_env(bot: AsyncMock):
+def _interactive_env(
+    bot: AsyncMock,
+    *,
+    advisory: bool = False,
+    ui_name: str = "AskUserQuestion",
+):
     """Patch the terminal capture + routing collaborators of handle_interactive_ui."""
     with (
         patch(
             f"{_UI}._capture_interactive_content",
             new_callable=AsyncMock,
-            return_value=("AskUserQuestion", "Pick one:"),
+            return_value=(ui_name, "Pick one:", advisory, None),
         ),
         patch(f"{_UI}.thread_router") as mock_router,
         patch(f"{_UI}.rate_limit_send", new_callable=AsyncMock),
@@ -171,6 +178,7 @@ class TestInteractiveModeTracking:
     @pytest.fixture(autouse=True)
     def _clear_interactive_mode(self) -> None:
         _interactive_mode.clear()
+        _interactive_panes.clear()
 
     def test_set_and_get(self) -> None:
         set_interactive_mode(100, "@0", thread_id=42, chat_id=-999)
@@ -184,6 +192,21 @@ class TestInteractiveModeTracking:
     def test_none_thread_uses_zero(self) -> None:
         set_interactive_mode(100, "@0", thread_id=None, chat_id=-999)
         assert get_interactive_window(100, None, chat_id=-999) == "@0"
+
+    def test_window_level_prompt_is_not_replaced_by_a_sibling(self) -> None:
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999)
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%2")
+        assert get_interactive_pane(100, 42, chat_id=-999) is None
+
+    def test_window_level_prompt_replaces_a_sibling_owner(self) -> None:
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%2")
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999)
+        assert get_interactive_pane(100, 42, chat_id=-999) is None
+
+    def test_later_sibling_replaces_an_earlier_sibling(self) -> None:
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%2")
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%3")
+        assert get_interactive_pane(100, 42, chat_id=-999) == "%3"
 
 
 @pytest.fixture
@@ -238,6 +261,63 @@ class TestSendCooldown:
 
         remaining = _send_cooldowns[(100, -999, 42)] - time.monotonic()
         assert remaining <= _SEND_RETRY_INTERVAL
+
+
+class TestAdvisoryInteractiveMode:
+    async def test_first_successful_advisory_send_does_not_latch_blocking_mode(
+        self, _clear_send_state
+    ) -> None:
+        bot = _sending_bot()
+
+        with _interactive_env(bot, advisory=True):
+            assert await handle_interactive_ui(bot, 100, "@2", thread_id=42) is True
+
+        assert get_interactive_window(100, 42, chat_id=-999) is None
+
+    async def test_advisory_send_clears_stale_blocking_latch(
+        self, _clear_send_state
+    ) -> None:
+        set_interactive_mode(100, "@old", thread_id=42, chat_id=-999)
+        bot = _sending_bot()
+
+        with _interactive_env(bot, advisory=True):
+            assert await handle_interactive_ui(bot, 100, "@2", thread_id=42) is True
+
+        assert get_interactive_window(100, 42, chat_id=-999) is None
+
+    async def test_named_permission_prompt_still_latches_blocking_mode(
+        self, _clear_send_state
+    ) -> None:
+        bot = _sending_bot()
+
+        with _interactive_env(bot, ui_name="PermissionPrompt"):
+            assert await handle_interactive_ui(bot, 100, "@2", thread_id=42) is True
+
+        assert get_interactive_window(100, 42, chat_id=-999) == "@2"
+
+    async def test_editing_advisory_message_to_named_prompt_latches_blocking_mode(
+        self, _clear_send_state
+    ) -> None:
+        bot = _sending_bot()
+
+        with (
+            _interactive_env(bot),
+            patch(
+                f"{_UI}._capture_interactive_content",
+                new_callable=AsyncMock,
+                side_effect=[
+                    ("SelectionUI", "Pick an action:", True, None),
+                    ("PermissionPrompt", "Do you want to proceed?", False, None),
+                ],
+            ),
+        ):
+            assert await handle_interactive_ui(bot, 100, "@2", thread_id=42) is True
+            assert get_interactive_window(100, 42, chat_id=-999) is None
+            assert await handle_interactive_ui(bot, 100, "@2", thread_id=42) is True
+
+        bot.send_message.assert_awaited_once()
+        bot.edit_message_text.assert_awaited_once()
+        assert get_interactive_window(100, 42, chat_id=-999) == "@2"
 
 
 class TestPaneLabel:

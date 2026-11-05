@@ -49,11 +49,12 @@ Change Telegram interactive UX:
 - `src/ccgram/handlers/messaging_pipeline/message_queue.py` for ordering/merge.
 - `src/ccgram/handlers/live/live_view.py` for live view sessions.
 
-Change command discovery / menu:
+Change command discovery / topic command panel:
 
 - `src/ccgram/command_catalog.py` for filesystem scan + caching.
-- `src/ccgram/cc_commands.py` for Telegram menu registration.
-- `src/ccgram/handlers/commands/menu_sync.py` for scoped per-window menu sync.
+- `src/ccgram/cc_commands.py` for shared Telegram slash controls and provider command discovery.
+- `src/ccgram/handlers/commands/menu_sync.py` for shared control menus scoped to chats and members.
+- `src/ccgram/handlers/commands/panel.py` for topic-specific inline command panels and safe dispatch.
 
 Change `/commands` failure probe / status snapshot:
 
@@ -119,7 +120,7 @@ Change session binding logic:
 
 Adjust transcript/status parsing:
 
-- Provider-specific in `providers/*.py`. Shared in `transcript_parser.py` / `terminal_parser.py`. Entry-type dispatch is in the small `_handle_*` functions inside `transcript_parser.py`; add new entry types there without touching the public `parse_entries` signature.
+- Transcript normalization lives in `session_protocol/messages.py` (`parse_records`, `build_messages`). Telegram formatting lives in `transcript_reader.py`; history and live delivery share the canonical records. Terminal status detection remains in `providers/*.py` and `terminal_parser.py`. See `docs/protocol/implementation.md`.
 
 Change hook event record or session-map record schema:
 

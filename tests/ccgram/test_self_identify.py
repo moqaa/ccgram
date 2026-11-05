@@ -7,7 +7,6 @@ neither, and nested-session rejection (the last exercised through
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -182,14 +181,11 @@ class TestResolveHerdrTarget:
     ) -> str | None:
         import ccgram.hook as hook
 
+        monkeypatch.setenv("HERDR_SOCKET_PATH", "/tmp/herdr-identity-test.sock")
         monkeypatch.setattr(
-            hook.subprocess,
-            "run",
-            lambda *_args, **_kwargs: SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({"result": {"agents": records}}),
-                stderr="",
-            ),
+            hook.herdr_socket,
+            "request_sync",
+            lambda *_args, **_kwargs: {"result": {"agents": records}},
         )
         monkeypatch.setattr(
             hook,
@@ -271,6 +267,9 @@ class TestLocatePrimaryWindowThroughResolver:
         monkeypatch.delenv("TMUX_PANE", raising=False)
         monkeypatch.delenv("HERDR_PANE_ID", raising=False)
         monkeypatch.setenv("AGTERM_SESSION_ID", "157B4C8C-EFAE-40C2-BA54-9A5D7FD8B5E4")
+        monkeypatch.setattr(
+            "ccgram.hook._agterm_hook_target", lambda target, *_args: (target, "")
+        )
         from ccgram.hook import _locate_primary_window
 
         located = _locate_primary_window("sid", "Stop", "claude")

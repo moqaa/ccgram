@@ -1,7 +1,7 @@
 """Herdr backend for the Multiplexer contract, via the herdr CLI/socket.
 
-Anti-corruption layer over `herdr <https://github.com/ogulcancelik/herdr>`_'s
-Unix-socket JSON-RPC CLI. Every herdr JSON shape (``pane_info`` / ``pane_list``
+Anti-corruption layer over `herdr <https://github.com/herdrdev/herdr>`_'s
+public Unix-socket JSON API. Every herdr JSON shape (``pane_info`` / ``pane_list``
 / ``pane_process_info`` / ``pane_layout`` / ``tab_created`` …) and every
 ``wN:pN``/``wN:tN`` id string stays **private** to this module; callers see
 only the neutral value types from ``multiplexer.base`` (design "Module map":
@@ -14,12 +14,10 @@ current terminal identity as a short-lived fallback so hooks and reconciliation
 can still agree on a live target. Raw locators are used only after a fresh guard
 authorizes one action; they are never persisted as aliases.
 
-The backend shells out to the ``herdr`` CLI (which the design explicitly allows
-as an alternative to talking the socket directly); the socket path is passed
-through ``$HERDR_SOCKET_PATH``. The command runner is injectable so unit tests
-feed JSON fixtures without a live socket and the constructor stays I/O-free
-(the proxy/registry can build the backend before bootstrap; the socket is only
-touched on the first real call).
+Ordinary operations use the public socket API, independently of the CLI's
+private protocol version. ``HERDR_SOCKET_PATH`` selects the endpoint; when
+unset, ``herdr status --json`` discovers it. The command-shaped runner remains
+injectable for tests, and construction stays I/O-free.
 
 Capabilities (design "MultiplexerCapabilities"): ``ids_stable_across_restart``
 is False (a herdr *server* restart re-mints ids, and nothing re-resolves a
@@ -69,6 +67,8 @@ from .herdr_events import (
     open_socket_stream,
     translate_event,
 )
+from .herdr_commands import command_request
+from .herdr_socket import HerdrSocketError, request as socket_request
 from .topic_mapping import format_agent_topic_prefix
 
 __all__ = [
@@ -90,9 +90,9 @@ __all__ = [
 logger = structlog.get_logger()
 
 # Supported herdr socket protocols (``herdr status`` → ``server.protocol``).
-# 14–20 are supported. Other versions are attempted with a warning so ccgram
-# remains usable across Herdr upgrades and downgrades.
-HERDR_SUPPORTED_PROTOCOLS = frozenset(range(14, 21))
+# Version numbers are diagnostic; operation and identity schemas remain checked
+# even when a future server adds a new private protocol version.
+HERDR_SUPPORTED_PROTOCOLS = frozenset(range(14, 23))
 HERDR_PROTOCOL_VERSION = max(HERDR_SUPPORTED_PROTOCOLS)
 
 # Static capability declaration for the herdr backend (design Task 7).
@@ -108,6 +108,7 @@ _HERDR_CAPABILITIES = MultiplexerCapabilities(
     supports_display_name_rebind=False,
     supports_workspace_selection=True,
     native_topic_targets=True,
+    supports_shell_prompt_markers=True,
 )
 
 # Filter for self-hosted / internal workspaces and tabs (e.g. ``__main__``).
@@ -139,8 +140,21 @@ _CALL_TIMEOUT_SECONDS = 8.0
 
 # New Pi sessions have been observed to publish their agent_session in ~2.7s.
 # Keep creation discovery bounded, while allowing slow hook/integration startup.
-_CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS = 5.0
-_CREATED_SESSION_POLL_INTERVAL_SECONDS = 0.1
+# A freshly launched agent must publish its session within this budget
+# for topic creation to commit. Boot under load has been measured past 5s
+# (2026-09-29 incident), and creation waits for the stable session-backed
+# identity, not the terminal fallback, so the budget has to cover real
+# boot time. The poll interval stays a coarse 0.5s: each poll is a full
+# agent.list subprocess, and a 20s window at 0.1s would spawn it ~200
+# times per slow launch.
+_CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS = 20.0
+_CREATED_SESSION_POLL_INTERVAL_SECONDS = 0.5
+
+# The terminal-derived identity published for a recognized agent whose
+# session has not been reported yet. It rotates to the session identity
+# the moment the agent publishes, so it must never become a topic target
+# or an adoption candidate.
+_TERMINAL_FALLBACK_KIND = "terminal"
 
 # Agent TUIs (Claude Code, Codex, Pi) read a submit key that arrives in the
 # same input batch as the prompt text as a literal newline, so the prompt is
@@ -317,7 +331,9 @@ def _parse_live_record(record: Mapping[str, object]) -> HerdrLiveRecord | None:
         # identity. Pi is excluded: Herdr publishes its durable session shortly
         # after startup, and creating a terminal topic in that gap would create
         # a second topic when the durable identity arrives.
-        composite = HerdrSessionComposite("herdr", agent, "terminal", terminal_id)
+        composite = HerdrSessionComposite(
+            "herdr", agent, _TERMINAL_FALLBACK_KIND, terminal_id
+        )
     target_id = herdr_session_target_id(composite)
     # ``cwd`` is the agent's own working directory; ``foreground_cwd`` follows
     # whatever the agent currently shells into (a worktree, a plugin cache) and
@@ -407,7 +423,7 @@ class HerdrManager:
 
         Args:
             socket_path: herdr socket; defaults to ``$HERDR_SOCKET_PATH``.
-            binary: the ``herdr`` executable name/path.
+            binary: CLI used only to discover the socket when none is configured.
             runner: async ``(args) -> (rc, stdout, stderr)`` override for tests.
             stream_opener: event-stream opener override for tests; defaults to
                 the live unix-socket reader (``open_socket_stream``).
@@ -418,19 +434,71 @@ class HerdrManager:
         # subprocess.Popen._execute_child). Bare names force fork_exec, which
         # triggers macOS ``MallocStackLogging`` spam from long-lived parents.
         self._binary = shutil.which(binary) or binary
-        self._run: HerdrRunner = runner or self._subprocess_run
+        self._run: HerdrRunner = runner or self._socket_run
         self._open_stream: HerdrStreamOpener = stream_opener or self._default_stream
 
-    def _default_stream(
+    async def _default_stream(
         self, subscriptions: Sequence[Mapping[str, object]]
     ) -> AsyncGenerator[dict, None]:
-        """Open the live herdr socket and subscribe (default stream opener)."""
-        return open_socket_stream(self._socket_path, subscriptions)
+        """Subscribe on the same resolved socket used by ordinary requests."""
+        socket_path = await self._resolve_socket_path()
+        async for event in open_socket_stream(socket_path, subscriptions):
+            yield event
 
-    # ── CLI plumbing (private) ─────────────────────────────────────────
+    async def _resolve_socket_path(self) -> str:
+        if self._socket_path:
+            return self._socket_path
+        rc, out, _err = await self._subprocess_run(["status", "--json"])
+        if rc == 0:
+            try:
+                status = json.loads(out)
+            except ValueError:
+                status = None
+            server = status.get("server") if isinstance(status, dict) else None
+            path = server.get("socket") if isinstance(server, dict) else None
+            if isinstance(path, str) and path:
+                self._socket_path = path
+                return path
+        raise HerdrError(
+            "Cannot discover the Herdr socket; set HERDR_SOCKET_PATH to the running server"
+        )
+
+    async def _socket_run(self, args: Sequence[str]) -> tuple[int, str, str]:
+        """Adapt internal command arguments without executing the CLI."""
+        try:
+            method, params = command_request(args)
+            path = await self._resolve_socket_path()
+            payload = await socket_request(
+                path, method, params, timeout=_CALL_TIMEOUT_SECONDS
+            )
+            result = payload["result"]
+            if args[0] == "status":
+                if result.get("type") != "pong":
+                    raise HerdrSocketError("herdr ping returned no pong")
+                status = {
+                    "server": {
+                        "running": True,
+                        "version": result.get("version"),
+                        "protocol": result.get("protocol"),
+                        "capabilities": result.get("capabilities", {}),
+                        "socket": path,
+                    }
+                }
+                return 0, json.dumps(status), ""
+            if tuple(args[:2]) == ("pane", "read"):
+                read = result.get("read")
+                text = read.get("text") if isinstance(read, dict) else None
+                if not isinstance(text, str):
+                    raise HerdrSocketError("herdr pane.read returned no text")
+                return 0, text, ""
+            return 0, json.dumps(payload), ""
+        except (HerdrSocketError, HerdrError, ValueError) as exc:
+            return 1, "", str(exc)
+
+    # ── Command runner compatibility seam (private) ────────────────────
 
     async def _subprocess_run(self, args: Sequence[str]) -> tuple[int, str, str]:
-        """Default runner: exec ``herdr <args>`` with the socket env, time-boxed."""
+        """Run the CLI for socket discovery only, with a bounded wait."""
         env = dict(os.environ)
         if self._socket_path:
             env["HERDR_SOCKET_PATH"] = self._socket_path
@@ -526,9 +594,9 @@ class HerdrManager:
         """Verify Herdr is reachable; warn but do not gate on compatibility.
 
         ``HERDR_SUPPORTED_PROTOCOLS`` are accepted without a warning. Other
-        protocol versions and a false CLI compatibility flag are best-effort:
-        ccgram logs a warning and continues so CLI-backed operations can try
-        the current command surface after a Herdr change. Individual commands
+        protocol versions and an injected runner's false compatibility flag are
+        best-effort: the public API is independent of the CLI's private wire
+        protocol. Individual commands
         still report their own transport or schema failures.
 
         Raises:
@@ -690,6 +758,7 @@ class HerdrManager:
             cwd=record.cwd,
             pane_current_command=record.composite.agent,
             topic_eligible=adoptable
+            and record.composite.kind != _TERMINAL_FALLBACK_KIND
             and is_herdr_session_target(record.target_id)
             and bool(record.composite.agent.strip()),
         )
@@ -1027,12 +1096,13 @@ class HerdrManager:
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
         """Reject raw Herdr pane IDs; only a session target may authorize I/O."""
         if window_id is None or pane_id != window_id:
             logger.warning("Rejected raw Herdr pane operation")
             return False
-        return await self.send(window_id, text, enter=enter, literal=literal)
+        return await self.send(window_id, text, enter=enter, literal=literal, raw=raw)
 
     async def _send_to(
         self, pane_id: str, text: str, *, enter: bool, literal: bool
@@ -1279,28 +1349,109 @@ class HerdrManager:
         tab_id: str,
         pane_id: str,
         workspace_id: str | None,
+        terminal_id: str | None = None,
     ) -> HerdrLiveRecord:
-        """Wait for exactly one session reported for a newly-created pane."""
+        """Wait for the pane's stable, session-backed identity.
+
+        Only a complete session composite counts. A terminal-fallback
+        record (the pane's agent has started but not yet published its
+        session) is deliberately skipped: its derived target rotates the
+        moment the real session appears, and a target minted from it
+        goes stale during hook registration, which reads as "session
+        did not register and is gone" while the pane boots on.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS
+        # The first poll pins the pane by the locators the creation
+        # transaction owns; every later poll follows the TERMINAL identity
+        # instead. Pane and tab ids are renumbered on structural changes
+        # (compaction), so a slow boot whose pane moved mid-wait would
+        # never re-match on locators and the transaction would roll back
+        # a healthy pane. The terminal id survives renumbering.
+        pinned_seen = False
         while True:
-            matches = [
-                record
-                for record in await self._agent_list_snapshot()
-                if record.tab_id == tab_id
-                and record.pane_id == pane_id
-                and (workspace_id is None or record.workspace_id == workspace_id)
-            ]
-            if len(matches) == 1:
-                return matches[0]
+            records = await self._agent_list_snapshot()
+            terminal_id, pinned_seen = self._advance_created_session_pin(
+                records,
+                tab_id=tab_id,
+                pane_id=pane_id,
+                workspace_id=workspace_id,
+                terminal_id=terminal_id,
+                pinned_seen=pinned_seen,
+            )
+            matches = self._session_backed_matches(records, terminal_id)
             if len(matches) > 1:
                 raise HerdrAmbiguousTargetError(
                     "new Herdr pane reported duplicate sessions"
                 )
+            if len(matches) == 1:
+                first = matches[0]
+                # Guard the pre-pinned identity: before any poll has
+                # confirmed the created pane at this terminal (a sibling
+                # agent cannot share a terminal id with it, but a stale or
+                # misattributed record could sit there), the match must
+                # also carry one of the creation locators. Once the first
+                # poll confirms the pane, renumbering may change both
+                # locators, so later polls trust the terminal id alone.
+                if pinned_seen or first.tab_id == tab_id or first.pane_id == pane_id:
+                    return first
             if loop.time() >= deadline:
                 break
             await asyncio.sleep(_CREATED_SESSION_POLL_INTERVAL_SECONDS)
         raise HerdrUnresolvedTargetError("new Herdr pane did not report a session")
+
+    @staticmethod
+    def _advance_created_session_pin(
+        records: Sequence[HerdrLiveRecord],
+        *,
+        tab_id: str,
+        pane_id: str,
+        workspace_id: str | None,
+        terminal_id: str | None,
+        pinned_seen: bool,
+    ) -> tuple[str | None, bool]:
+        """Advance the created-pane pin one poll; returns (terminal, pinned).
+
+        A pre-pinned terminal is confirmed by any record (a terminal
+        fallback counts) at the creation locators. Without one, the first
+        unique record at the creation locators supplies the terminal id.
+        """
+        if terminal_id is not None:
+            if pinned_seen:
+                return terminal_id, True
+            return terminal_id, any(
+                record.terminal_id == terminal_id
+                and (record.tab_id == tab_id or record.pane_id == pane_id)
+                for record in records
+            )
+        pinned = [
+            record
+            for record in records
+            if record.tab_id == tab_id
+            and record.pane_id == pane_id
+            and (workspace_id is None or record.workspace_id == workspace_id)
+        ]
+        if len(pinned) > 1:
+            raise HerdrAmbiguousTargetError(
+                "new Herdr pane reported duplicate sessions"
+            )
+        if len(pinned) == 1:
+            return pinned[0].terminal_id, True
+        return None, False
+
+    @staticmethod
+    def _session_backed_matches(
+        records: Sequence[HerdrLiveRecord], terminal_id: str | None
+    ) -> list[HerdrLiveRecord]:
+        """Session-published records at one terminal, fallbacks excluded."""
+        if terminal_id is None:
+            return []
+        return [
+            record
+            for record in records
+            if record.terminal_id == terminal_id
+            and record.composite.kind != _TERMINAL_FALLBACK_KIND
+        ]
 
     async def create_topic_target(  # noqa: C901
         self,
@@ -1360,6 +1511,9 @@ class HerdrManager:
             root = (result or {}).get("root_pane") or {}
             tab_id = tab.get("tab_id") if isinstance(tab, Mapping) else None
             pane_id = root.get("pane_id") if isinstance(root, Mapping) else None
+            created_terminal_id = (
+                root.get("terminal_id") if isinstance(root, Mapping) else None
+            )
             label = tab.get("label") if isinstance(tab, Mapping) else None
             if not isinstance(tab_id, str) or not tab_id:
                 raise HerdrError("herdr tab creation returned no tab id")
@@ -1377,6 +1531,9 @@ class HerdrManager:
                 tab_id=tab_id,
                 pane_id=pane_id,
                 workspace_id=workspace_id,
+                terminal_id=created_terminal_id
+                if isinstance(created_terminal_id, str)
+                else None,
             )
             refs = await self._project_live_refs([record])
             if len(refs) != 1:
@@ -1445,6 +1602,7 @@ class HerdrManager:
         if not tab_id:
             tab_id = workspace.get("active_tab_id", "")
         pane_id = root_pane.get("pane_id")
+        created_terminal_id = root_pane.get("terminal_id")
         if not isinstance(tab_id, str) or not tab_id:
             return False, "herdr worktree created without a tab id", "", ""
         if not isinstance(pane_id, str) or not pane_id:
@@ -1471,6 +1629,9 @@ class HerdrManager:
                 tab_id=tab_id,
                 pane_id=pane_id,
                 workspace_id=workspace_id,
+                terminal_id=created_terminal_id
+                if isinstance(created_terminal_id, str)
+                else None,
             )
         except BaseException as exc:
             await self._call_ok(["tab", "close", tab_id])
@@ -1606,7 +1767,7 @@ class HerdrManager:
                         if pending_event is not None:
                             pending_event.cancel()
                             await asyncio.gather(pending_event, return_exceptions=True)
-            except OSError as exc:
+            except (OSError, HerdrError) as exc:
                 logger.debug("herdr event stream error: %s", exc)
             if refresh_subscriptions:
                 # A mapping change is a healthy re-subscription, not a transport

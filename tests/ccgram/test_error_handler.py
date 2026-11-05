@@ -1,8 +1,6 @@
-"""Tests for bot-level error handler, shutdown notification, and signal diagnostics."""
+"""Tests for bot-level errors and shutdown presentation."""
 
-import contextlib
-import io
-import signal
+from collections.abc import Iterator
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,8 +9,10 @@ from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, Teleg
 from telegram.request import HTTPXRequest
 
 from ccgram.bot import (
+    GET_SHUTDOWN_REASON_KEY,
     _error_handler,
     _record_successful_poll,
+    cancel_shutdown_watchdog,
     _reset_polling_conflict_state,
     _send_shutdown_notification,
     polling_conflict_requires_restart,
@@ -21,8 +21,13 @@ from ccgram.telegram_request import ResilientPollingHTTPXRequest
 
 
 @pytest.fixture(autouse=True)
-def _reset_conflict_state() -> None:
+def _reset_conflict_state() -> Iterator[None]:
+    cancel_shutdown_watchdog()
     _reset_polling_conflict_state()
+    try:
+        yield
+    finally:
+        cancel_shutdown_watchdog()
 
 
 def _make_context(error: BaseException) -> MagicMock:
@@ -109,12 +114,14 @@ class TestErrorHandlerStaleCallback:
 
         with (
             patch("ccgram.bot.logger") as mock_logger,
+            patch("ccgram.bot.arm_shutdown_watchdog") as arm_watchdog,
             patch("ccgram.bot.time.monotonic", side_effect=[100.0, 190.0]),
         ):
             await _error_handler(None, ctx)
             await _error_handler(None, ctx)
 
         ctx.application.stop_running.assert_called_once()
+        arm_watchdog.assert_called_once_with()
         assert polling_conflict_requires_restart() is True
         mock_logger.critical.assert_called_once()
 
@@ -136,30 +143,37 @@ class TestErrorHandlerStaleCallback:
             b'{"ok": false, "error_code": 409, "description": "Conflict"}',
         )
         ctx = _make_context(Conflict("placeholder"))
+        watchdog_timer = MagicMock()
 
-        with (
-            patch.object(HTTPXRequest, "do_request", AsyncMock(return_value=response)),
-            patch("ccgram.bot.time.monotonic", side_effect=[100.0, 190.0]),
-        ):
-            for _ in range(2):
-                with pytest.raises(Conflict) as raised:
-                    await request.post("https://example.com")
-                ctx.error = raised.value
-                await _error_handler(None, ctx)
+        try:
+            with (
+                patch.object(
+                    HTTPXRequest, "do_request", AsyncMock(return_value=response)
+                ),
+                patch("ccgram.bot.threading.Timer", return_value=watchdog_timer),
+                patch("ccgram.bot.time.monotonic", side_effect=[100.0, 190.0]),
+            ):
+                for _ in range(2):
+                    with pytest.raises(Conflict) as raised:
+                        await request.post("https://example.com")
+                    ctx.error = raised.value
+                    await _error_handler(None, ctx)
+        finally:
+            cancel_shutdown_watchdog()
 
         ctx.application.stop_running.assert_called_once()
         assert polling_conflict_requires_restart() is True
+        watchdog_timer.cancel.assert_called_once_with()
 
 
 class TestShutdownNotification:
-    async def test_sends_to_general_topic(self) -> None:
+    @pytest.mark.parametrize("reason", ["Clean exit", "Received SIGINT"])
+    async def test_sends_runtime_reason_to_general_topic(self, reason: str) -> None:
         app = MagicMock()
         app.bot.send_message = AsyncMock()
+        app.bot_data = {GET_SHUTDOWN_REASON_KEY: lambda: reason}
 
-        with (
-            patch("ccgram.bot.config") as mock_config,
-            patch("ccgram.main._shutdown_signal", signal.SIGINT),
-        ):
+        with patch("ccgram.bot.config") as mock_config:
             mock_config.group_id = -100123
             await _send_shutdown_notification(app)
 
@@ -167,7 +181,7 @@ class TestShutdownNotification:
         call_kwargs = app.bot.send_message.call_args.kwargs
         assert call_kwargs["chat_id"] == -100123
         assert "message_thread_id" not in call_kwargs
-        assert "SIGINT" in call_kwargs["text"]
+        assert reason in call_kwargs["text"]
 
     async def test_skipped_without_group_id(self) -> None:
         app = MagicMock()
@@ -179,57 +193,26 @@ class TestShutdownNotification:
 
         app.bot.send_message.assert_not_called()
 
-    async def test_clean_exit_reason(self) -> None:
+    async def test_clean_exit_without_runtime_reason_getter(self) -> None:
         app = MagicMock()
         app.bot.send_message = AsyncMock()
+        app.bot_data = {}
 
-        with (
-            patch("ccgram.bot.config") as mock_config,
-            patch("ccgram.main._shutdown_signal", 0),
-        ):
+        with patch("ccgram.bot.config") as mock_config:
             mock_config.group_id = -100123
             await _send_shutdown_notification(app)
 
         text = app.bot.send_message.call_args.kwargs["text"]
         assert "Clean exit" in text
 
-    async def test_send_failure_does_not_crash(self) -> None:
+    @pytest.mark.parametrize(
+        "error", [TelegramError("forbidden"), RuntimeError("closed")]
+    )
+    async def test_send_failure_does_not_crash(self, error: Exception) -> None:
         app = MagicMock()
-        app.bot.send_message = AsyncMock(side_effect=TelegramError("forbidden"))
+        app.bot.send_message = AsyncMock(side_effect=error)
+        app.bot_data = {}
 
-        with (
-            patch("ccgram.bot.config") as mock_config,
-            patch("ccgram.main._shutdown_signal", 0),
-        ):
+        with patch("ccgram.bot.config") as mock_config:
             mock_config.group_id = -100123
             await _send_shutdown_notification(app)
-
-
-class TestSignalDiagnostics:
-    def test_signal_handler_records_signum_and_raises(self) -> None:
-        from ccgram import main
-
-        stderr_capture = io.StringIO()
-        with (
-            patch.object(main, "_shutdown_signal", 0),
-            patch("sys.stderr", stderr_capture),
-        ):
-            with contextlib.suppress(SystemExit):
-                main._on_signal(signal.SIGINT)
-            assert main._shutdown_signal == signal.SIGINT
-
-        output = stderr_capture.getvalue()
-        assert "SIGINT" in output
-        assert "call stack" not in output
-
-    def test_install_uses_loop_add_signal_handler(self) -> None:
-        from ccgram.main import _install_signal_handlers, _on_signal
-
-        loop = MagicMock()
-        _install_signal_handlers(loop)
-
-        registered = {call.args[0] for call in loop.add_signal_handler.call_args_list}
-        assert registered == {signal.SIGINT, signal.SIGTERM, signal.SIGQUIT}
-        for call in loop.add_signal_handler.call_args_list:
-            assert call.args[1] is _on_signal
-            assert call.args[2] == call.args[0]

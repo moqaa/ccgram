@@ -9,10 +9,38 @@ lifecycle.
 import asyncio
 import contextlib
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from telegram.error import TelegramError
+
+
+class _FakeWatchdogTimer:
+    """Threading.Timer stand-in: records arm/cancel without a real thread."""
+
+    def __init__(self, interval: float, function: Callable[[], None]) -> None:
+        self.interval = interval
+        self.function = function
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+def _record_timer(
+    timers: list[_FakeWatchdogTimer], interval: float, function: Callable[[], None]
+) -> _FakeWatchdogTimer:
+    timer = _FakeWatchdogTimer(interval, function)
+    timers.append(timer)
+    return timer
 
 
 class TestScreenBufferResilience:
@@ -51,8 +79,12 @@ class TestScreenBufferResilience:
 
 
 class TestJsonlMalformedEntries:
-    def test_non_dict_message_field_skipped_in_parse(self):
-        from ccgram.providers._jsonl import parse_jsonl_entries
+    def test_non_dict_message_fields_are_skipped_by_both_protocol_reads(self):
+        from ccgram.session_protocol.messages import (
+            SourceEntry,
+            build_messages,
+            parse_records,
+        )
 
         entries = [
             {"type": "assistant", "message": "not a dict"},
@@ -60,27 +92,15 @@ class TestJsonlMalformedEntries:
             {"type": "assistant", "message": None},
             {"type": "assistant", "message": 42},
         ]
-        messages, _ = parse_jsonl_entries(entries, {})
-        assert len(messages) == 1
-        assert messages[0].text == "valid text"
+        source = [
+            SourceEntry(index * 100, entry) for index, entry in enumerate(entries)
+        ]
 
-    def test_non_dict_message_field_skipped_in_history(self):
-        from ccgram.providers._jsonl import parse_jsonl_history_entry
+        live, _ = parse_records(source, "claude")
+        history = build_messages(source, "conv", "claude")
 
-        assert (
-            parse_jsonl_history_entry({"type": "assistant", "message": "string"})
-            is None
-        )
-        assert parse_jsonl_history_entry({"type": "assistant", "message": None}) is None
-        assert parse_jsonl_history_entry({"type": "assistant", "message": 42}) is None
-
-    def test_valid_entry_still_parsed(self):
-        from ccgram.providers._jsonl import parse_jsonl_history_entry
-
-        entry = {"type": "assistant", "message": {"content": "hello world"}}
-        result = parse_jsonl_history_entry(entry)
-        assert result is not None
-        assert result.text == "hello world"
+        assert [record.parts[0]["text"] for _, record in live] == ["valid text"]
+        assert [message.parts[0].text for message in history] == ["valid text"]
 
 
 class TestSessionMapCorruptionGuard:
@@ -289,6 +309,14 @@ class TestGlobalExceptionHandler:
 
 
 class TestShutdownNotificationLifecycle:
+    @pytest.fixture(autouse=True)
+    def _disarm_shutdown_watchdog(self):
+        from ccgram.bot import cancel_shutdown_watchdog
+
+        cancel_shutdown_watchdog()
+        yield
+        cancel_shutdown_watchdog()
+
     async def test_post_stop_sends_notification(self):
         from ccgram.bot import post_stop
 
@@ -303,6 +331,133 @@ class TestShutdownNotificationLifecycle:
             await post_stop(application)
 
         mock_send.assert_awaited_once_with(application)
+
+    async def test_post_stop_arms_the_shutdown_watchdog(self):
+        from ccgram.bot import (
+            _SHUTDOWN_WATCHDOG_SECONDS,
+            _force_exit_after_wedged_shutdown,
+            post_stop,
+        )
+
+        application = MagicMock()
+        application.bot = AsyncMock()
+        timers: list[_FakeWatchdogTimer] = []
+
+        with (
+            patch("ccgram.bot._send_shutdown_notification", new_callable=AsyncMock),
+            patch(
+                "ccgram.bot.threading.Timer",
+                side_effect=lambda interval, fn: _record_timer(timers, interval, fn),
+            ),
+        ):
+            await post_stop(application)
+
+        assert len(timers) == 1
+        timer = timers[0]
+        assert timer.interval == _SHUTDOWN_WATCHDOG_SECONDS
+        assert timer.started and timer.daemon and not timer.cancelled
+        assert timer.function is _force_exit_after_wedged_shutdown
+
+    async def test_post_stop_keeps_the_first_watchdog(self):
+        from ccgram.bot import post_stop
+
+        application = MagicMock()
+        application.bot = AsyncMock()
+        timers: list[_FakeWatchdogTimer] = []
+
+        with (
+            patch("ccgram.bot._send_shutdown_notification", new_callable=AsyncMock),
+            patch(
+                "ccgram.bot.threading.Timer",
+                side_effect=lambda interval, fn: _record_timer(timers, interval, fn),
+            ),
+        ):
+            await post_stop(application)
+            await post_stop(application)
+
+        assert len(timers) == 1
+
+    async def test_post_shutdown_cancels_the_watchdog(self):
+        from ccgram.bot import post_shutdown, post_stop
+
+        application = MagicMock()
+        application.bot = AsyncMock()
+        timers: list[_FakeWatchdogTimer] = []
+
+        with (
+            patch("ccgram.bot._send_shutdown_notification", new_callable=AsyncMock),
+            patch(
+                "ccgram.bot.threading.Timer",
+                side_effect=lambda interval, fn: _record_timer(timers, interval, fn),
+            ),
+            patch("ccgram.bootstrap._status_poll_task", None),
+            patch("ccgram.bootstrap.session_monitor", None),
+            patch("ccgram.bootstrap.session_manager"),
+            patch("ccgram.bootstrap.shutdown_workers", new_callable=AsyncMock),
+        ):
+            await post_stop(application)
+            await post_shutdown(application)
+
+        assert len(timers) == 1 and timers[0].cancelled
+
+    def test_watchdog_flushes_logs_then_forces_exit(self):
+        from ccgram.bot import _force_exit_after_wedged_shutdown
+
+        with (
+            patch("ccgram.bot.logging.shutdown") as mock_flush,
+            patch("ccgram.bot.os._exit") as mock_exit,
+        ):
+            _force_exit_after_wedged_shutdown()
+
+        mock_flush.assert_called_once_with()
+        mock_exit.assert_called_once_with(1)
+
+    def test_watchdog_forces_exit_even_when_flush_fails(self):
+        from ccgram.bot import _force_exit_after_wedged_shutdown
+
+        with (
+            patch("ccgram.bot.logging.shutdown", side_effect=RuntimeError("flush")),
+            patch("ccgram.bot.os._exit") as mock_exit,
+        ):
+            _force_exit_after_wedged_shutdown()
+
+        mock_exit.assert_called_once_with(1)
+
+    def test_watchdog_uses_the_armed_exit_code(self):
+        from ccgram.bot import arm_shutdown_watchdog
+
+        timers: list[_FakeWatchdogTimer] = []
+        with (
+            patch(
+                "ccgram.bot.threading.Timer",
+                side_effect=lambda interval, fn: _record_timer(timers, interval, fn),
+            ),
+            patch("ccgram.bot.logging.shutdown"),
+            patch("ccgram.bot.os._exit") as mock_exit,
+        ):
+            arm_shutdown_watchdog(exit_code=143)
+            timers[0].function()
+
+        mock_exit.assert_called_once_with(143)
+
+    def test_watchdog_does_not_wait_for_a_blocked_flush(self):
+        from ccgram.bot import _force_exit_after_wedged_shutdown
+
+        def _blocked_flush() -> None:
+            time.sleep(5.0)
+
+        with (
+            patch("ccgram.bot._WATCHDOG_FLUSH_SECONDS", 0.05),
+            patch("ccgram.bot.logging.shutdown", side_effect=_blocked_flush),
+            patch("ccgram.bot.os._exit") as mock_exit,
+        ):
+            started = time.monotonic()
+            _force_exit_after_wedged_shutdown()
+            elapsed = time.monotonic() - started
+
+        # Returns on the bound, not on the 5s flush.
+        assert elapsed < 2.0
+        mock_exit.assert_called_once_with(1)
 
     async def test_post_shutdown_does_not_send_notification(self):
         from ccgram.bot import post_shutdown
@@ -367,6 +522,7 @@ class TestShellDetectionSafety:
     async def test_setup_shell_prompt_skips_own_window(self):
         from ccgram.providers.shell import setup_shell_prompt
 
+        adapter = AsyncMock()
         with (
             patch("ccgram.config.config") as mock_config,
             patch(
@@ -379,13 +535,19 @@ class TestShellDetectionSafety:
             ),
         ):
             mock_config.own_window_id = "@99"
-            await setup_shell_prompt("@99", clear=False)
+            await setup_shell_prompt("@99", clear=False, adapter=adapter)
 
         mock_has_marker.assert_not_awaited()
+        adapter.setup_prompt.assert_not_awaited()
 
     async def test_setup_shell_prompt_skips_non_interactive(self):
         from ccgram.providers.shell import setup_shell_prompt
 
+        adapter = AsyncMock()
+        adapter.resolve.return_value = (
+            MagicMock(pane_id="%5"),
+            MagicMock(binding_version=1),
+        )
         with (
             patch("ccgram.config.config") as mock_config,
             patch(
@@ -399,6 +561,7 @@ class TestShellDetectionSafety:
             ) as mock_has_marker,
         ):
             mock_config.own_window_id = None
-            await setup_shell_prompt("@5", clear=False)
+            await setup_shell_prompt("@5", clear=False, adapter=adapter)
 
         mock_has_marker.assert_not_awaited()
+        adapter.setup_prompt.assert_not_awaited()

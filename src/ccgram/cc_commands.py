@@ -8,7 +8,7 @@ Scans three sources to build the command list:
 Core components:
   - CCCommand dataclass: name, telegram_name, description, source
   - discover_cc_commands(): filesystem scanner with caching
-  - register_commands(): sets Telegram bot menu (BotCommand list)
+  - register_commands(): sets shared Telegram controls, with opt-in provider menus
   - get_cc_name(): reverse lookup from sanitized telegram name to CC name
 """
 
@@ -37,6 +37,7 @@ CC_BUILTINS: dict[str, str] = {
     "branch": "↗ Fork conversation at current point",
     "clear": "↗ Clear conversation context",
     "compact": "↗ Summarize history to free context",
+    "config": "↗ Open Settings interface (alias /settings)",
     "context": "↗ Show context window usage",
     "copy": "↗ Copy last response to clipboard",
     "cost": "↗ Show session cost (alias /usage)",
@@ -77,6 +78,7 @@ _BOT_COMMANDS: list[tuple[str, str]] = [
     ("commands", "List commands for this topic provider"),
     ("history", "Message history for this topic"),
     ("sessions", "Sessions dashboard"),
+    ("dashboard", "Open this session's dashboard"),
     ("resume", "Browse and resume past sessions"),
     ("screenshot", "Capture terminal screenshot"),
     ("live", "Open auto-refreshing terminal view"),
@@ -89,6 +91,13 @@ _BOT_COMMANDS: list[tuple[str, str]] = [
     ("verbose", "Toggle tool call batching"),
     ("upgrade", "Upgrade ccgram and restart"),
 ]
+
+CONTROL_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("commands", "Open this topic’s command panel"),
+    ("sessions", "Sessions dashboard"),
+    ("sync", "Audit and fix state"),
+    ("upgrade", "Upgrade ccgram and restart"),
+)
 
 # Telegram limits: max 100 commands, descriptions max 256 chars
 _MAX_TELEGRAM_COMMANDS = 100
@@ -282,24 +291,31 @@ async def register_commands(
     claude_dir: Path | None = None,
     provider: AgentProvider | None = None,
     providers: Iterable[AgentProvider] | None = None,
-    include_cc_commands: bool = True,
+    include_cc_commands: bool | None = None,
     scope: BotCommandScope | None = None,
 ) -> None:
-    """Discover CC commands and register them in the Telegram bot menu.
+    """Register the four shared controls, or explicitly include provider commands.
 
-    When *providers* is given, commands are merged from each provider in order.
+    With *include_cc_commands=True*, commands are merged from *providers* in order.
     When *provider* is given, command discovery is delegated to that provider.
-    Registers bot-native commands first (start, history, etc.), then up to
+    The explicit provider-menu mode registers bot-native commands first, then up to
     the remaining Telegram limit of discovered CC commands. Deduplicates
     by telegram_name (first-wins) and excludes collisions with bot-native names.
     """
+    # Telegram has no topic command scope. Default to actions safe in General;
+    # provider/session discovery belongs in the topic-specific inline panel.
+    full_menu = (
+        include_cc_commands
+        if include_cc_commands is not None
+        else provider is not None or providers is not None
+    )
     commands = (
         _refresh_cache(claude_dir, provider=provider, providers=providers)
-        if include_cc_commands
+        if full_menu
         else []
     )
-
-    bot_commands = [BotCommand(name, desc) for name, desc in _BOT_COMMANDS]
+    native_commands = _BOT_COMMANDS if full_menu else CONTROL_COMMANDS
+    bot_commands = [BotCommand(name, desc) for name, desc in native_commands]
     max_cc = _MAX_TELEGRAM_COMMANDS - len(bot_commands)
 
     # Pre-populate with bot-native names to avoid collisions

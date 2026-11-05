@@ -76,7 +76,7 @@ class TestShellOriginWindowStartingAnAgent:
         _live_pane(monkeypatch, _window("2.1.283"))
 
         agent_exited = await _detect_and_apply_provider(
-            WINDOW_ID, _claude_identity(), _window("zsh")
+            WINDOW_ID, _claude_identity(), _window("zsh"), adapter=MagicMock()
         )
 
         assert agent_exited is False
@@ -95,7 +95,9 @@ class TestShellOriginWindowStartingAnAgent:
             ensure_setup,
         )
 
-        await _detect_and_apply_provider(WINDOW_ID, _claude_identity(), _window("zsh"))
+        await _detect_and_apply_provider(
+            WINDOW_ID, _claude_identity(), _window("zsh"), adapter=MagicMock()
+        )
 
         session_manager.set_window_provider.assert_called_once_with(
             WINDOW_ID, "shell", cwd="/Users/me/cc/daily"
@@ -115,7 +117,7 @@ class TestAgentOriginWindow:
         _live_pane(monkeypatch, _window("2.1.283"))
 
         agent_exited = await _detect_and_apply_provider(
-            WINDOW_ID, _claude_identity(), _window("zsh")
+            WINDOW_ID, _claude_identity(), _window("zsh"), adapter=MagicMock()
         )
 
         assert agent_exited is False
@@ -127,8 +129,21 @@ class TestAgentOriginWindow:
         _live_pane(monkeypatch, _window("zsh"))
 
         agent_exited = await _detect_and_apply_provider(
-            WINDOW_ID, _claude_identity(), _window("zsh")
+            WINDOW_ID, _claude_identity(), _window("zsh"), adapter=MagicMock()
         )
 
         assert agent_exited is True
         session_manager.set_window_provider.assert_not_called()
+
+    async def test_a_window_the_live_lookup_cannot_find_keeps_the_listing_verdict(
+        self, monkeypatch: pytest.MonkeyPatch, session_manager: MagicMock
+    ) -> None:
+        # A gone window is the dead-session path's job; the exit report from the
+        # listing stands rather than being silently dropped.
+        _live_pane(monkeypatch, None)
+
+        agent_exited = await _detect_and_apply_provider(
+            WINDOW_ID, _claude_identity(), _window("zsh"), adapter=MagicMock()
+        )
+
+        assert agent_exited is True

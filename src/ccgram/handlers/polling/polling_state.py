@@ -32,6 +32,7 @@ from ...topic_state_registry import topic_state
 from .polling_types import (
     MAX_PROBE_FAILURES,
     PANE_COUNT_TTL,
+    PROBE_SUSPENSION_SECONDS,
     RC_DEBOUNCE_SECONDS,
     STARTUP_TIMEOUT,
     TYPING_INTERVAL,
@@ -245,6 +246,7 @@ class TerminalScreenBuffer:
                 display_label=interactive.name,
                 is_interactive=True,
                 ui_type=interactive.name,
+                ui_advisory=interactive.advisory,
             )
             ws.last_pane_hash = content_hash
             ws.last_pyte_result = result
@@ -333,6 +335,7 @@ class TerminalPollState:
         ws = self._states.get(window_id)
         if ws:
             ws.probe_failures = 0
+            ws.probe_suspended_at = None
 
     def clear_seen_status(self, window_id: str) -> None:
         """Clear all startup-settlement tracking for a single window."""
@@ -358,6 +361,7 @@ class TerminalPollState:
         """Reset probe failure counters for all windows."""
         for ws in self._states.values():
             ws.probe_failures = 0
+            ws.probe_suspended_at = None
 
     def reset_all_seen_status(self) -> None:
         """Reset all startup-settlement tracking for every window."""
@@ -476,9 +480,9 @@ class InteractiveUIStrategy:
 
 
 class TopicLifecycleStrategy:
-    """Autoclose timers, dead notification tracking, probe failure state.
+    """Dead notification tracking, typing state, and probe failure state.
 
-    Async lifecycle functions (check_autoclose_timers, probe_topic_existence) live in
+    Async lifecycle functions (probe_topic_existence) live in
     topic_lifecycle.py; handle_dead_window_notification lives in window_tick.py.
     Both access state through this strategy.
     """
@@ -502,34 +506,9 @@ class TopicLifecycleStrategy:
         """Record that a dead notification was sent."""
         self._dead_notified.add((user_id, thread_id, window_id))
 
-    def iter_topic_states(self) -> list[tuple[int, int, TopicPollState]]:
-        """Return list of (user_id, thread_id, state) for all tracked topics."""
-        return [(uid, tid, ts) for (uid, tid), ts in self._states.items()]
-
     def clear_state(self, user_id: int, thread_id: int) -> None:
         """Remove all polling state for a topic."""
         self._states.pop((user_id, thread_id), None)
-
-    def start_autoclose_timer(
-        self, user_id: int, thread_id: int, state: str, now: float
-    ) -> None:
-        """Start or maintain an autoclose timer for done/dead state."""
-        ts = self.get_state(user_id, thread_id)
-        existing = ts.autoclose
-        if existing is None or existing[0] != state:
-            ts.autoclose = (state, now)
-
-    def clear_autoclose_timer(self, user_id: int, thread_id: int) -> None:
-        """Clear autoclose timer for a topic (on cleanup or when active)."""
-        ts = self._states.get((user_id, thread_id))
-        if ts:
-            ts.autoclose = None
-
-    def reset_autoclose_state(self) -> None:
-        """Reset all autoclose tracking (for testing)."""
-        for ts in self._states.values():
-            ts.autoclose = None
-        self._poll_state.reset_all_unbound_timers()
 
     def clear_dead_notification(self, user_id: int, thread_id: int) -> None:
         """Remove dead notification tracking for a topic."""
@@ -568,15 +547,27 @@ class TopicLifecycleStrategy:
         return (time.monotonic() - ts.last_typing_sent) < TYPING_INTERVAL
 
     def should_skip_probe(self, window_id: str) -> bool:
-        """Check if a window has exceeded the probe failure threshold."""
+        """Check whether a window is still suspended after probe failures."""
         ws = self._poll_state.get_state(window_id)
-        return ws.probe_failures >= MAX_PROBE_FAILURES
+        if ws.probe_failures < MAX_PROBE_FAILURES:
+            return False
+
+        now = time.monotonic()
+        if ws.probe_suspended_at is None:
+            ws.probe_suspended_at = now
+        if now - ws.probe_suspended_at < PROBE_SUSPENSION_SECONDS:
+            return True
+
+        self._poll_state.reset_probe_failures(window_id)
+        return False
 
     def record_probe_failure(self, window_id: str) -> int:
         """Increment probe failure counter; log once when threshold is reached."""
         ws = self._poll_state.get_state(window_id)
         ws.probe_failures += 1
         count = ws.probe_failures
+        if count >= MAX_PROBE_FAILURES and ws.probe_suspended_at is None:
+            ws.probe_suspended_at = time.monotonic()
         if count == MAX_PROBE_FAILURES:
             logger.info(
                 "Suspending topic probe for %s after %d consecutive failures",

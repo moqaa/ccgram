@@ -1,5 +1,5 @@
 """Tests for polling strategy classes: state management, RC debounce,
-autoclose timers, pane alerts, probe failures, and content-hash caching."""
+pane alerts, probe failures, and content-hash caching."""
 
 import time
 from unittest.mock import patch
@@ -15,6 +15,7 @@ from ccgram.handlers.polling.polling_state import (
 )
 from ccgram.handlers.polling.polling_types import (
     MAX_PROBE_FAILURES,
+    PROBE_SUSPENSION_SECONDS,
     RC_DEBOUNCE_SECONDS,
     STARTUP_TIMEOUT,
     TYPING_INTERVAL,
@@ -230,8 +231,10 @@ class TestTerminalPollState:
     def test_reset_probe_failures(self):
         ws = self.strategy.get_state("@0")
         ws.probe_failures = 5
+        ws.probe_suspended_at = 123.0
         self.strategy.reset_probe_failures("@0")
         assert ws.probe_failures == 0
+        assert ws.probe_suspended_at is None
 
     def test_clear_seen_status(self):
         ws = self.strategy.get_state("@0")
@@ -254,10 +257,14 @@ class TestTerminalPollState:
 
     def test_reset_all_probe_failures(self):
         self.strategy.get_state("@0").probe_failures = 3
+        self.strategy.get_state("@0").probe_suspended_at = 100.0
         self.strategy.get_state("@1").probe_failures = 7
+        self.strategy.get_state("@1").probe_suspended_at = 200.0
         self.strategy.reset_all_probe_failures()
         assert self.strategy.get_state("@0").probe_failures == 0
+        assert self.strategy.get_state("@0").probe_suspended_at is None
         assert self.strategy.get_state("@1").probe_failures == 0
+        assert self.strategy.get_state("@1").probe_suspended_at is None
 
     def test_reset_all_seen_status(self):
         self.strategy.get_state("@0").has_seen_status = True
@@ -361,38 +368,11 @@ class TestTopicLifecycleStrategy:
     def test_get_state_creates_new(self):
         ts = self.strategy.get_state(1, 42)
         assert isinstance(ts, TopicPollState)
-        assert ts.autoclose is None
 
     def test_clear_state(self):
         self.strategy.get_state(1, 42)
         self.strategy.clear_state(1, 42)
         assert (1, 42) not in self.strategy._states
-
-    def test_start_autoclose_timer(self):
-        self.strategy.start_autoclose_timer(1, 42, "done", 100.0)
-        ts = self.strategy.get_state(1, 42)
-        assert ts.autoclose == ("done", 100.0)
-
-    def test_start_autoclose_timer_does_not_overwrite_same_state(self):
-        self.strategy.start_autoclose_timer(1, 42, "done", 100.0)
-        self.strategy.start_autoclose_timer(1, 42, "done", 200.0)
-        ts = self.strategy.get_state(1, 42)
-        assert ts.autoclose == ("done", 100.0)
-
-    def test_start_autoclose_timer_overwrites_different_state(self):
-        self.strategy.start_autoclose_timer(1, 42, "done", 100.0)
-        self.strategy.start_autoclose_timer(1, 42, "dead", 200.0)
-        ts = self.strategy.get_state(1, 42)
-        assert ts.autoclose == ("dead", 200.0)
-
-    def test_clear_autoclose_timer_when_active(self):
-        self.strategy.start_autoclose_timer(1, 42, "done", 100.0)
-        self.strategy.clear_autoclose_timer(1, 42)
-        ts = self.strategy.get_state(1, 42)
-        assert ts.autoclose is None
-
-    def test_clear_autoclose_timer_nonexistent(self):
-        self.strategy.clear_autoclose_timer(1, 42)
 
     def test_clear_dead_notification(self):
         self.strategy._dead_notified.add((1, 42, "@0"))
@@ -411,8 +391,10 @@ class TestTopicLifecycleStrategy:
     def test_clear_probe_failures(self):
         ws = self.poll_state.get_state("@0")
         ws.probe_failures = 5
+        ws.probe_suspended_at = 123.0
         self.strategy.clear_probe_failures("@0")
         assert ws.probe_failures == 0
+        assert ws.probe_suspended_at is None
 
     def test_record_probe_failure_increments(self):
         count = self.strategy.record_probe_failure("@0")
@@ -427,21 +409,59 @@ class TestTopicLifecycleStrategy:
             self.strategy.record_probe_failure("@0")
             mock_logger.info.assert_called_once()
 
+    def test_probe_suspension_expires_at_interval(self):
+        ws = self.poll_state.get_state("@0")
+        with patch(
+            "ccgram.handlers.polling.polling_state.time.monotonic", return_value=100.0
+        ):
+            for _ in range(MAX_PROBE_FAILURES):
+                self.strategy.record_probe_failure("@0")
+
+        assert ws.probe_suspended_at == 100.0
+        with patch(
+            "ccgram.handlers.polling.polling_state.time.monotonic",
+            return_value=100.0 + PROBE_SUSPENSION_SECONDS - 0.1,
+        ):
+            assert self.strategy.should_skip_probe("@0")
+
+        with patch(
+            "ccgram.handlers.polling.polling_state.time.monotonic",
+            return_value=100.0 + PROBE_SUSPENSION_SECONDS,
+        ):
+            assert not self.strategy.should_skip_probe("@0")
+
+        assert ws.probe_failures == 0
+        assert ws.probe_suspended_at is None
+
+    def test_probe_suspension_can_recur_after_expiry(self):
+        ws = self.poll_state.get_state("@0")
+        with patch(
+            "ccgram.handlers.polling.polling_state.time.monotonic", return_value=100.0
+        ):
+            for _ in range(MAX_PROBE_FAILURES):
+                self.strategy.record_probe_failure("@0")
+        with patch(
+            "ccgram.handlers.polling.polling_state.time.monotonic",
+            return_value=100.0 + PROBE_SUSPENSION_SECONDS,
+        ):
+            assert not self.strategy.should_skip_probe("@0")
+        with patch(
+            "ccgram.handlers.polling.polling_state.time.monotonic", return_value=2000.0
+        ):
+            for _ in range(MAX_PROBE_FAILURES):
+                self.strategy.record_probe_failure("@0")
+
+        assert ws.probe_suspended_at == 2000.0
+        with patch(
+            "ccgram.handlers.polling.polling_state.time.monotonic", return_value=2000.0
+        ):
+            assert self.strategy.should_skip_probe("@0")
+
     def test_clear_typing_state(self):
         ts = self.strategy.get_state(1, 42)
         ts.last_typing_sent = 123.0
         self.strategy.clear_typing_state(1, 42)
         assert ts.last_typing_sent is None
-
-    def test_reset_autoclose_state_clears_all(self):
-        self.strategy.start_autoclose_timer(1, 42, "done", 100.0)
-        self.strategy.start_autoclose_timer(2, 43, "dead", 200.0)
-        ws = self.poll_state.get_state("@0")
-        ws.unbound_timer = 50.0
-        self.strategy.reset_autoclose_state()
-        for ts in self.strategy._states.values():
-            assert ts.autoclose is None
-        assert ws.unbound_timer is None
 
     def test_is_typing_throttled_true(self):
         ts = self.strategy.get_state(1, 42)

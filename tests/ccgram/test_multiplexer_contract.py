@@ -12,6 +12,8 @@ a backend can't silently drop a flag callers gate on.
 from __future__ import annotations
 
 import inspect
+import json
+from collections.abc import Sequence
 
 import pytest
 
@@ -106,6 +108,7 @@ def test_backend_capabilities_shape(backend: Multiplexer) -> None:
     assert isinstance(caps.native_worktrees, bool)
     assert isinstance(caps.supports_workspace_selection, bool)
     assert isinstance(caps.native_topic_targets, bool)
+    assert isinstance(caps.supports_shell_prompt_markers, bool)
 
 
 def test_tmux_capability_values() -> None:
@@ -121,6 +124,7 @@ def test_tmux_capability_values() -> None:
     assert caps.native_worktrees is False
     assert caps.supports_workspace_selection is False
     assert caps.native_topic_targets is False
+    assert caps.supports_shell_prompt_markers is True
 
 
 async def test_tmux_agent_status_returns_none() -> None:
@@ -156,6 +160,7 @@ def test_herdr_capability_values() -> None:
     assert caps.native_worktrees is True
     assert caps.supports_workspace_selection is True
     assert caps.native_topic_targets is True
+    assert caps.supports_shell_prompt_markers is True
 
 
 # ── window identity matching (WindowRef.matches / window_presence) ─────
@@ -224,3 +229,194 @@ async def test_window_presence_is_none_when_the_backend_cannot_answer() -> None:
             return None
 
     assert await window_presence("@5", _Backend()) is None
+
+
+_HERDR_WINDOW_ID = "herdr-session-v1-" + "a" * 64
+_AGTERM_WINDOW_ID = "157B4C8C-EFAE-40C2-BA54-9A5D7FD8B5E4"
+_AGTERM_SPLIT_ID = f"{_AGTERM_WINDOW_ID}:split-" + "a" * 20
+
+
+class _NeverCallAgtermRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(
+        self, args: Sequence[str], stdin_text: str | None = None
+    ) -> tuple[int, str, str]:
+        self.calls += 1
+        raise AssertionError(f"foreign window reached agterm runner: {list(args)}")
+
+
+class _NeverCallHerdrRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, args: Sequence[str]) -> tuple[int, str, str]:
+        self.calls += 1
+        raise AssertionError(f"foreign window reached Herdr runner: {list(args)}")
+
+
+@pytest.mark.parametrize(
+    "window_id",
+    [
+        pytest.param(_HERDR_WINDOW_ID, id="herdr"),
+        pytest.param("@42", id="tmux"),
+        pytest.param("agterm-session-v2-unknown", id="future"),
+        pytest.param(f"{_AGTERM_WINDOW_ID}:split-malformed", id="malformed-split"),
+    ],
+)
+async def test_agterm_does_not_prove_foreign_ids_absent(window_id: str) -> None:
+    from ccgram.multiplexer.agterm import AgtermManager
+    from ccgram.multiplexer.reconciliation import window_presence, window_snapshot
+
+    runner = _NeverCallAgtermRunner()
+    backend = AgtermManager(
+        socket_path="/tmp/agterm.sock",
+        runner=runner,
+        own_session_id="",
+        workspaces=None,
+    )
+
+    assert await window_presence(window_id, backend) is None
+    assert await window_snapshot(window_id, backend) == (False, None)
+    assert runner.calls == 0
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [
+        ("live", True),
+        ("closed-peer", False),
+        ("closed-owner", False),
+        ("unavailable", None),
+        ("owner-moved", None),
+        ("unknown-peer", None),
+    ],
+)
+async def test_guarded_split_presence_is_confirmed_or_unknown(state, expected):
+    from ccgram.multiplexer.agterm import AgtermManager
+    from ccgram.multiplexer.agterm_panes import pane_sessions
+    from ccgram.multiplexer.reconciliation import window_presence
+
+    owner = {
+        "id": _AGTERM_WINDOW_ID,
+        "name": "peer",
+        "cwd": "/repo",
+        "hasSplit": True,
+        "splitForeground": ["claude"],
+    }
+    target = pane_sessions(owner)[1]["id"]
+
+    async def runner(args, stdin=None):
+        if state == "unavailable":
+            return 1, "", "socket unavailable"
+        if list(args[:2]) == ["window", "list"]:
+            result = {"windows": [{"id": "window", "open": True}]}
+        elif args[0] == "tree":
+            sessions = (
+                []
+                if state in {"closed-owner", "owner-moved"}
+                else [
+                    {
+                        **owner,
+                        "hasSplit": state != "closed-peer",
+                        "splitForeground": None
+                        if state == "unknown-peer"
+                        else ["claude"],
+                    }
+                ]
+            )
+            result = {"tree": {"workspaces": [{"name": "code", "sessions": sessions}]}}
+        else:
+            assert list(args[:2]) == ["session", "text"]
+            if state == "closed-owner":
+                return (
+                    1,
+                    json.dumps(
+                        {"ok": False, "error": f"no such session: {_AGTERM_WINDOW_ID}"}
+                    ),
+                    "",
+                )
+            result = {"text": "owner still exists in a different window"}
+        return 0, json.dumps({"ok": True, "result": result}), ""
+
+    backend = AgtermManager(runner=runner, own_session_id="", workspaces=None)
+    assert await window_presence(target, backend) is expected
+
+
+async def test_agterm_split_id_is_checked_by_backend() -> None:
+    from ccgram.multiplexer.agterm import AgtermManager
+    from ccgram.multiplexer.reconciliation import window_presence
+
+    async def runner(args, stdin=None):
+        if list(args[:2]) == ["window", "list"]:
+            result = {"windows": [{"id": "window", "open": True}]}
+        else:
+            assert args[0] == "tree"
+            result = {
+                "tree": {
+                    "workspaces": [
+                        {
+                            "name": "code",
+                            "sessions": [
+                                {
+                                    "id": _AGTERM_WINDOW_ID,
+                                    "name": "repo",
+                                    "cwd": "/repo",
+                                    "hasSplit": False,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        return 0, json.dumps({"ok": True, "result": result}), ""
+
+    backend = AgtermManager(runner=runner, own_session_id="", workspaces=None)
+    assert await window_presence(_AGTERM_SPLIT_ID, backend) is False
+
+
+@pytest.mark.parametrize(
+    "window_id",
+    [
+        pytest.param("@42", id="tmux"),
+        pytest.param(_AGTERM_WINDOW_ID, id="agterm"),
+        pytest.param("w2:t1", id="herdr-legacy-locator"),
+        pytest.param("herdr-session-v2-unknown", id="future"),
+    ],
+)
+async def test_herdr_does_not_prove_foreign_ids_absent(window_id: str) -> None:
+    from ccgram.multiplexer.herdr import HerdrManager
+    from ccgram.multiplexer.reconciliation import window_presence, window_snapshot
+
+    runner = _NeverCallHerdrRunner()
+    backend = HerdrManager(socket_path="/tmp/herdr.sock", runner=runner)
+
+    assert await window_presence(window_id, backend) is None
+    assert await window_snapshot(window_id, backend) == (False, None)
+    assert runner.calls == 0
+
+
+@pytest.mark.parametrize(
+    "window_id",
+    [
+        pytest.param(_HERDR_WINDOW_ID, id="herdr"),
+        pytest.param(_AGTERM_WINDOW_ID, id="agterm"),
+        pytest.param("tmux-window-v2-unknown", id="future"),
+    ],
+)
+async def test_tmux_does_not_prove_foreign_ids_absent(
+    window_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ccgram.multiplexer.reconciliation import window_presence, window_snapshot
+    from ccgram.multiplexer.tmux import TmuxManager
+
+    backend = TmuxManager(session_name="ccgram-namespace-test")
+
+    async def unexpected_listing() -> list[object]:
+        raise AssertionError("foreign window reached tmux listing")
+
+    monkeypatch.setattr(backend, "list_windows_for_reconciliation", unexpected_listing)
+
+    assert await window_presence(window_id, backend) is None
+    assert await window_snapshot(window_id, backend) == (False, None)

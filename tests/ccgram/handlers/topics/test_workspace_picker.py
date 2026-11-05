@@ -7,6 +7,7 @@ The chosen workspace id then has to survive all the way to window creation.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -67,6 +68,7 @@ def _make_query() -> AsyncMock:
 def _make_context(user_data: dict | None = None) -> MagicMock:
     ctx = MagicMock()
     ctx.user_data = user_data if user_data is not None else {}
+    ctx.bot_data = {}
     ctx.bot = AsyncMock()
     ctx.bot.edit_forum_topic = AsyncMock()
     return ctx
@@ -91,6 +93,34 @@ _WORKSPACES = [
 
 
 class TestShowWorkspacePickerOrProvider:
+    @pytest.fixture(autouse=True)
+    def _workspace_picker_on(self, monkeypatch: pytest.MonkeyPatch):
+        """The picker is opt-in; these tests exercise the on state."""
+        from ccgram.config import config
+
+        monkeypatch.setattr(config, "workspace_picker", True, raising=False)
+        yield
+
+    @patch(
+        "ccgram.handlers.topics.workspace_callbacks.safe_edit", new_callable=AsyncMock
+    )
+    @patch("ccgram.handlers.topics.workspace_callbacks.tmux_manager")
+    async def test_picker_off_by_default_skips_to_provider(
+        self, mock_mux: MagicMock, mock_edit: AsyncMock, tmp_path: Path
+    ) -> None:
+        from ccgram.config import config
+
+        config.workspace_picker = False
+        mock_mux.capabilities = _capabilities(native_agent_status=True)
+        mock_mux.list_workspaces = AsyncMock(return_value=_WORKSPACES)
+
+        await _show_workspace_picker_or_provider(
+            _make_query(), str(tmp_path), _make_context({})
+        )
+
+        assert "Select Provider" in mock_edit.call_args[0][1]
+        mock_mux.list_workspaces.assert_not_awaited()
+
     @patch(
         "ccgram.handlers.topics.workspace_callbacks.safe_edit", new_callable=AsyncMock
     )
@@ -297,6 +327,7 @@ class TestWorkspaceIdThreaded:
 
         with (
             patch(f"{module}tmux_manager") as mock_mux,
+            patch(f"{module}adapter_for") as mock_adapter_for,
             patch(f"{module}session_manager"),
             patch(f"{module}thread_router") as mock_tr,
             patch(f"{module}topic_orchestration"),
@@ -306,8 +337,21 @@ class TestWorkspaceIdThreaded:
             patch(f"{module}provider_registry") as mock_reg,
             patch("ccgram.providers.resolve_launch_command", return_value="claude"),
         ):
-            mock_mux.create_window = AsyncMock(
-                return_value=(True, "ok", "my-tab", "w1:t1")
+            adapter = mock_adapter_for.return_value
+            adapter.create = AsyncMock(
+                return_value=SimpleNamespace(
+                    target_id="w1:t1",
+                    title="my-tab",
+                    session=SimpleNamespace(title="my-tab"),
+                )
+            )
+            adapter.resolve = AsyncMock(
+                return_value=(
+                    SimpleNamespace(
+                        foreground_argv=("claude",), provider="claude", available=True
+                    ),
+                    None,
+                )
             )
             mock_mux.stamp_pane_title = AsyncMock()
             mock_mux.capabilities.native_worktrees = False
@@ -334,8 +378,7 @@ class TestWorkspaceIdThreaded:
                 ),
             )
 
-        mock_mux.create_window.assert_awaited_once()
+        adapter.create.assert_awaited_once()
         assert (
-            mock_mux.create_window.call_args.kwargs.get("workspace_id")
-            == chosen_workspace_id
+            adapter.create.call_args.args[0].get("workspaceId") == chosen_workspace_id
         )

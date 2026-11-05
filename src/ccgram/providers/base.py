@@ -68,6 +68,22 @@ class AgentMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalControl:
+    """A verified native key action, independent of any remote UI layout."""
+
+    label: str
+    keys: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalMenu:
+    """Controls supported by one verified command menu in the active terminal."""
+
+    controls: tuple[TerminalControl, ...]
+    text_input: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class StatusUpdate:
     """Parsed terminal status line from the agent's pane.
 
@@ -84,6 +100,13 @@ class StatusUpdate:
     display_label: str
     is_interactive: bool = False
     ui_type: str | None = None  # "AskUserQuestion", "ExitPlanMode", etc.
+    # True when the detection is a structural guess (the catch-all
+    # selection shape) rather than a named pattern or action-hint
+    # anchor: the keyboard may be shown, but it must not latch the
+    # blocking interactive mode.
+    ui_advisory: bool = False
+    # Only verified command menus opt in; guesses and ordinary output stay out.
+    menu: TerminalMenu | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +133,21 @@ class HookEvent:
 
 
 # ── Capabilities ─────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class FirstRunPrompt:
+    """A blocking first-run screen a launch has to clear without a human.
+
+    ``needles`` must ALL appear (case-insensitive) in the captured pane
+    before ``keys`` are sent; ``settled`` is a substring that proves the
+    prompt is gone. Matching is exact-substring on purpose: a fuzzy match
+    would send keys into an unrelated screen.
+    """
+
+    needles: tuple[str, ...]
+    keys: tuple[str, ...]
+    settled: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +194,10 @@ class ProviderCapabilities:
     # pointing at /toolbar so users know how to drive the picker from
     # Telegram. Empty for providers without modal pickers.
     tui_picker_commands: frozenset[str] = frozenset()
+    # First-run approval/trust screen this agent shows before its prompt.
+    # None means "no recipe": the launcher then reports the block instead of
+    # guessing at keys.
+    first_run: FirstRunPrompt | None = None
 
 
 # ── Provider protocol ────────────────────────────────────────────────────
@@ -194,41 +236,6 @@ class AgentProvider(Protocol):
         """List sessions owned by this provider, optionally for one workspace."""
         ...
 
-    def parse_transcript_line(self, line: str) -> dict[str, Any] | None:
-        """Parse a single raw transcript line into a structured dict.
-
-        Returns None for empty, invalid, or skipped lines.
-        """
-        ...
-
-    def read_transcript_file(
-        self, file_path: str, last_offset: int
-    ) -> tuple[list[dict[str, Any]], int]:
-        """Read a whole-file transcript and return new entries since last_offset.
-
-        For providers with ``supports_incremental_read=False`` (e.g. Gemini),
-        this reads the entire file as JSON, extracts the messages array, and
-        returns only messages after index ``last_offset``.
-
-        Returns (new_entries, new_offset).
-        """
-        ...
-
-    def parse_transcript_entries(
-        self,
-        entries: list[dict[str, Any]],
-        pending_tools: dict[str, Any],
-        cwd: str | None = None,
-    ) -> tuple[list[AgentMessage], dict[str, Any]]:
-        """Parse a batch of transcript entries into AgentMessages.
-
-        Args:
-            cwd: Working directory for shortening file paths in tool summaries.
-
-        Returns (messages, updated_pending_tools).
-        """
-        ...
-
     def parse_terminal_status(
         self, pane_text: str, *, pane_title: str = ""
     ) -> StatusUpdate | None:
@@ -246,20 +253,6 @@ class AgentProvider(Protocol):
         """Extract ``!`` command output from a captured tmux pane.
 
         Returns the command echo and output lines, or None if not found.
-        """
-        ...
-
-    def is_user_transcript_entry(self, entry: dict[str, Any]) -> bool:
-        """Return True if this entry represents a human turn in the conversation.
-
-        Excludes tool results, summaries, system messages, and metadata.
-        """
-        ...
-
-    def parse_history_entry(self, entry: dict[str, Any]) -> AgentMessage | None:
-        """Parse a single raw transcript entry into an AgentMessage for history.
-
-        Returns None for non-parseable entries (summaries, metadata, etc.).
         """
         ...
 

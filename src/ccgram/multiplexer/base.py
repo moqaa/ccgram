@@ -279,6 +279,9 @@ class MultiplexerCapabilities:
     native_topic_targets: bool = False
     """True when creation must use the backend's guarded topic-target flow."""
 
+    supports_shell_prompt_markers: bool = False
+    """True when the backend can safely install the shell prompt marker."""
+
 
 # ── Protocol ───────────────────────────────────────────────────────────
 
@@ -396,11 +399,14 @@ class Multiplexer(Protocol):
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
         """Send text to a specific pane (by stable pane ID).
 
         ``window_id`` limits the search to that window (cross-window access
-        prevention).  Returns True on success.
+        prevention). Direct input is the default for existing shell callers.
+        ``raw=False`` enables TUI submission handling for agent messages.
+        Returns True on success.
         """
         ...
 

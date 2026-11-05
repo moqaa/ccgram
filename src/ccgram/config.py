@@ -8,6 +8,7 @@ The module-level `config` instance is imported by nearly every other module.
 Key class: Config (singleton instantiated as `config`).
 """
 
+import math
 import structlog
 import os
 from pathlib import Path
@@ -17,6 +18,20 @@ from dotenv import load_dotenv
 from .utils import ccgram_dir
 
 logger = structlog.get_logger()
+
+# Providers offered by default. Gemini is deliberately absent: keep it only
+# by listing it in CCGRAM_PROVIDERS_ENABLED.
+# Undelivered transcript (KiB) a restart may replay per session before the
+# remainder is treated as history. See _startup_replay_max_bytes.
+DEFAULT_STARTUP_REPLAY_MAX_KB = 256
+
+DEFAULT_ENABLED_PROVIDERS: tuple[str, ...] = (
+    "antigravity",
+    "claude",
+    "codex",
+    "pi",
+    "shell",
+)
 
 
 def _parse_int_env(name: str, default: int) -> int:
@@ -45,10 +60,138 @@ def _resolve_toolbar_path() -> str:
     return str(fallback) if fallback.exists() else ""
 
 
+def _skip_barrier_deadline_s() -> float:
+    """Backlog-skip barrier aging, floored so no value expires barriers
+    near-instantly and tolerant of empty, non-numeric, or non-finite
+    input (inf would disable expiry outright)."""
+    try:
+        value = float(os.getenv("CCGRAM_SKIP_BARRIER_DEADLINE_S") or 600.0)
+    except ValueError:
+        return 600.0
+    if not math.isfinite(value):
+        return 600.0
+    return max(60.0, value)
+
+
+def _delivery_watch_gap_bytes() -> int:
+    """Delivery-wedge gap threshold in bytes, floored at 0 (disable) and
+    tolerant of empty or non-numeric input so a bad env value cannot break
+    startup."""
+    try:
+        value = float(os.getenv("CCGRAM_DELIVERY_WATCH_GAP_KB") or 256.0)
+    except ValueError:
+        return 256 * 1024
+    if not math.isfinite(value):
+        return 256 * 1024
+    try:
+        return max(0, int(value * 1024))
+    except OverflowError, ValueError:
+        # Finite but too large for an int; treat like any other bad value.
+        return 256 * 1024
+
+
+def _flag_env(name: str, default: bool) -> bool:
+    """Parse an on/off env var, keeping *default* for unset or unrecognized values."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _choice_env(name: str, allowed: tuple[str, ...], default: str) -> str:
+    """Parse a closed-set env var, falling back to *default* when invalid."""
+    raw = (os.getenv(name) or "").strip().lower()
+    return raw if raw in allowed else default
+
+
+def _projects_roots_env() -> list[Path]:
+    """Project roots for typed session start: CCGRAM_PROJECTS_ROOTS.
+
+    os.pathsep-separated paths, each expanded. Unset defaults to
+    ~/Workspace when it exists, else ~. A configured entry that does not
+    exist is dropped, and when every configured entry is missing the result
+    is empty: the typed flow then falls back to the directory browser instead
+    of searching home behind the operator's back.
+    """
+    raw = (os.getenv("CCGRAM_PROJECTS_ROOTS") or "").strip()
+    if raw:
+        candidates = [p for p in raw.split(os.pathsep) if p.strip()]
+    else:
+        workspace = Path.home() / "Workspace"
+        candidates = [str(workspace if workspace.is_dir() else Path.home())]
+    roots: list[Path] = []
+    for entry in candidates:
+        try:
+            path = Path(entry).expanduser()
+            if path.is_dir():
+                roots.append(path.resolve())
+        except OSError:
+            continue
+    if not roots and raw:
+        logger.warning(
+            "CCGRAM_PROJECTS_ROOTS names no existing directory; project search "
+            "is empty and the typed flow falls back to the directory browser"
+        )
+    return roots
+
+
+def _startup_replay_max_bytes() -> int:
+    """Undelivered transcript a restart may replay: CCGRAM_STARTUP_REPLAY_MAX_KB.
+
+    A wedged or flood-limited queue leaves the delivered watermark far behind
+    the transcript, so an unbounded replay re-sends thousands of messages on
+    every restart and trips Telegram flood control. 0 disables the bound and
+    restores replay-everything.
+    """
+    raw = (os.getenv("CCGRAM_STARTUP_REPLAY_MAX_KB") or "").strip()
+    if not raw:
+        return DEFAULT_STARTUP_REPLAY_MAX_KB * 1024
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_STARTUP_REPLAY_MAX_KB * 1024
+    if not math.isfinite(value) or value <= 0:
+        return 0
+    return int(value * 1024)
+
+
+def _enabled_providers_env() -> tuple[str, ...]:
+    """Providers offered in pickers: CCGRAM_PROVIDERS_ENABLED.
+
+    The default list keeps Gemini out of the UI; its provider code stays
+    available to explicitly configured windows and resumes. An unset value
+    means DEFAULT_ENABLED_PROVIDERS; to offer every registered provider, list
+    them all explicitly.
+    """
+    raw = (os.getenv("CCGRAM_PROVIDERS_ENABLED") or "").strip()
+    if not raw:
+        return DEFAULT_ENABLED_PROVIDERS
+    return tuple(name.strip().lower() for name in raw.split(",") if name.strip())
+
+
+def _whisper_timeout_s() -> float:
+    """Seconds before the transcription POST gives up, floored at 1s and
+    tolerant of empty, non-numeric, or non-finite input (inf would disable
+    the timeout, nan would crash the event loop). Raise it for local
+    self-hosted backends that pay a model cold load on first request."""
+    try:
+        value = float(os.getenv("CCGRAM_WHISPER_TIMEOUT") or 60.0)
+    except ValueError:
+        return 60.0
+    if not math.isfinite(value):
+        return 60.0
+    return max(1.0, value)
+
+
 class Config:
     """Application configuration loaded from environment variables."""
 
-    def __init__(self) -> None:
+    def __init__(self) -> None:  # noqa: PLR0915
         self.config_dir = ccgram_dir()
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -103,6 +246,8 @@ class Config:
             max(0.5, float(os.getenv("CCGRAM_STATUS_POLL_INTERVAL", "1.0"))),
             max(1.0, float(os.getenv("CCGRAM_YOLO_CONFIRMATION_TIMEOUT", "30.0"))),
         )
+        self.skip_barrier_deadline_s = _skip_barrier_deadline_s()
+        self.delivery_watch_gap_bytes = _delivery_watch_gap_bytes()
 
         # Multi-instance support
         group_id_str = os.getenv("CCGRAM_GROUP_ID")
@@ -117,12 +262,42 @@ class Config:
         # Provider selection
         self.provider_name: str = os.getenv("CCGRAM_PROVIDER", "claude")
 
+        # Typed new-topic flow:
+        #   <agent>[:<mode>] <project|path> [@branch] <instruction>
+        # Each knob replaces a picker step. Defaults are the fewest-steps
+        # path: YOLO start, current branch, auto-resolved workspace, no
+        # bind-existing picker, first-run trust prompts answered for you.
+        self.default_mode: str = _choice_env(
+            "CCGRAM_DEFAULT_MODE", ("yolo", "normal"), "yolo"
+        )
+        self.projects_roots: list[Path] = _projects_roots_env()
+        # Opt-in worktrees: a typed @branch still works when this is off.
+        self.new_topic_worktrees: bool = _flag_env("CCGRAM_NEW_TOPIC_WORKTREES", False)
+        self.workspace_picker: bool = _flag_env("CCGRAM_WORKSPACE_PICKER", False)
+        self.bind_picker: bool = _flag_env("CCGRAM_BIND_PICKER", False)
+        self.autostart_trust: bool = _flag_env("CCGRAM_AUTOSTART_TRUST", True)
+        # Directory browser listing: git repositories + MRU only.
+        self.dir_browser_all_dirs: bool = _flag_env(
+            "CCGRAM_DIR_BROWSER_ALL_DIRS", False
+        )
+        self.enabled_providers: tuple[str, ...] = _enabled_providers_env()
+        self.startup_replay_max_bytes: int = _startup_replay_max_bytes()
+
         self._init_multiplexer()
 
         # Directory browser: show hidden (dot) directories
         self.show_hidden_dirs: bool = os.getenv(
             "CCGRAM_SHOW_HIDDEN_DIRS", ""
         ).lower() in ("1", "true", "yes")
+
+        # Dead-session topic retention. Topics are the session list. Deleting a
+        # dead session's topic also destroys the binding a later reconciliation
+        # could fold onto a re-keyed successor digest, so operators may keep
+        # dead topics and close them by hand (the recovery banner still
+        # answers the next message there). Default true = delete, as before.
+        self.autodelete_dead_topics: bool = os.getenv(
+            "CCGRAM_AUTODELETE_DEAD_TOPICS", "true"
+        ).strip().lower() not in ("0", "false", "no", "off")
 
         # Ack reaction: react to forwarded messages with an emoji (empty = disabled)
         self.ack_reaction: str = os.getenv("CCGRAM_ACK_REACTION", "")
@@ -133,6 +308,7 @@ class Config:
         self.whisper_base_url: str = os.getenv("CCGRAM_WHISPER_BASE_URL", "")
         self.whisper_model: str = os.getenv("CCGRAM_WHISPER_MODEL", "")
         self.whisper_language: str = os.getenv("CCGRAM_WHISPER_LANGUAGE", "")
+        self.whisper_timeout: float = _whisper_timeout_s()
 
         # Voice replies (text-to-speech)
         # CCGRAM_TTS_PROVIDER: empty = disabled; "edge" = edge-tts; "openai" = OpenAI TTS
@@ -202,9 +378,25 @@ class Config:
         )
 
     def _init_multiplexer(self) -> None:
-        """Select the terminal-multiplexer backend."""
-        # tmux default; herdr and agterm opt-in.
-        self.multiplexer_name: str = os.getenv("CCGRAM_MULTIPLEXER", "tmux")
+        """Select the terminal-multiplexer backend.
+
+        ``CCGRAM_MULTIPLEXER`` accepts a concrete backend name (``tmux``,
+        ``herdr``, ``agterm``) or the special value ``auto`` (the default).
+        In auto mode the backend is detected from environment variables:
+        ``HERDR_PANE_ID`` → herdr, ``TMUX_PANE`` → tmux,
+        ``AGTERM_SESSION_ID`` → agterm; falls back to ``tmux`` when none match.
+        """
+        raw = os.getenv("CCGRAM_MULTIPLEXER", "auto")
+        if raw == "auto":
+            # Lazy: avoid pulling in multiplexer.registry (and libtmux) at
+            # config import time; detect_multiplexer_name is pure env-var logic.
+            from ccgram.multiplexer.registry import (
+                detect_multiplexer_name,
+            )  # Lazy: env-only, no I/O
+
+            self.multiplexer_name: str = detect_multiplexer_name(dict(os.environ))
+        else:
+            self.multiplexer_name: str = raw
 
     def _init_live_view(self) -> None:
         self.live_view_interval: int = max(
@@ -236,11 +428,8 @@ class Config:
         self.send_max_results: int = _parse_int_env("CCGRAM_SEND_MAX_RESULTS", 50)
 
     def _init_lifecycle(self) -> None:
-        self.autoclose_done_minutes: int = int(
-            os.getenv("AUTOCLOSE_DONE_MINUTES", "30")
-        )
-        self.autoclose_dead_minutes: int = int(
-            os.getenv("AUTOCLOSE_DEAD_MINUTES", "10")
+        self.unbound_window_ttl_minutes: int = int(
+            os.getenv("UNBOUND_WINDOW_TTL_MINUTES", "30")
         )
         self.pane_lifecycle_notify: bool = os.getenv(
             "CCGRAM_PANE_LIFECYCLE_NOTIFY", ""
@@ -249,11 +438,6 @@ class Config:
         # Off by default: the title otherwise only refreshes on a status change.
         self.sync_topic_name_from_window: bool = os.getenv(
             "CCGRAM_SYNC_TOPIC_NAME_FROM_WINDOW", "false"
-        ).lower() in ("1", "true", "yes")
-        # Delete (not close) the topic of a window confirmed gone once the dead
-        # autoclose timer expires. Off by default: deletion is irreversible.
-        self.delete_dead_topics: bool = os.getenv(
-            "CCGRAM_DELETE_DEAD_TOPICS", "false"
         ).lower() in ("1", "true", "yes")
         # A topic exists only while an agent runs in its window: after this many
         # minutes with no hook-registered session, a live window's topic is

@@ -11,15 +11,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 import asyncio
+import contextlib
 from pathlib import Path
 
 import structlog
 from telegram import Message, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from ...config import config
 from ...telegram_client import PTBTelegramClient, TelegramClient
 from ..callback_helpers import get_thread_id as _get_thread_id
 from ..commands import sync_scoped_menu_for_text_context
+from ..topics.typed_topic import start_from_text
 from ..topics.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
@@ -36,12 +39,13 @@ from ..topics.directory_browser import (
     clear_worktree_state,
 )
 from ..topics import requested_topic_names
-from ..topics.worktree import (
+from ...worktrees import (
     slug_for_path,
     validate_branch_name,
     worktree_path_for,
 )
-from ..interactive import get_interactive_window, handle_interactive_ui
+from ..interactive import get_interactive_window
+from ..interactive.interactive_ui import get_interactive_prompt_fingerprint
 from ..messaging_pipeline.message_queue import enqueue_status_update
 from ..live.pane_callbacks import apply_pane_rename
 from ..messaging_pipeline.message_sender import (
@@ -52,6 +56,10 @@ from ..messaging_pipeline.message_sender import (
 )
 from ..recovery.recovery_banner import RecoveryBanner, render_banner
 from ..recovery.transcript_discovery import discover_and_register_transcript
+from ...session_protocol.telegram import (
+    TelegramSessionAdapter,
+    adapter_for as protocol_adapter_for,
+)
 from ..polling.polling_state import lifecycle_strategy
 from ..telegram_origin import (
     agent_origin_returned_to_shell,
@@ -82,6 +90,11 @@ logger = structlog.get_logger()
 
 # Maximum characters for bash output before truncation (fits Telegram 4096-char limit)
 _BASH_OUTPUT_LIMIT = 3800
+
+# Dismissal confirmation: attempts and interval for re-reading the
+# owning pane after an Escape, before concluding the prompt stayed.
+_DISMISS_CONFIRM_ATTEMPTS = 3
+_DISMISS_CONFIRM_INTERVAL_S = 0.3
 
 PENDING_DELIVERY_NOTICE = "\U0001f4ac Will deliver once the agent starts."
 
@@ -260,14 +273,21 @@ async def _handle_worktree_name_reply(
     return True
 
 
+def _browser_start_path() -> str:
+    """Directory-browser root: the first configured projects root."""
+    roots = config.projects_roots
+    return str(roots[0] if roots else Path.cwd())
+
+
 async def _handle_unbound_topic(
     user_id: int,
     thread_id: int,
     text: str,
     user_data: dict | None,
     message: Message,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> bool:
-    """Show window picker or directory browser for an unbound topic.
+    """Start a session for an unbound topic, or ask for the one missing word.
 
     Returns True if the topic is unbound (handled), False if already bound.
     """
@@ -275,10 +295,25 @@ async def _handle_unbound_topic(
     if window_id is not None:
         return False
 
+    # Typed plan first: "<agent> <project> [@branch] <instruction>" starts the
+    # session from this one message. No picker, no follow-up taps.
+    if (
+        context is not None
+        and text.strip()
+        and await start_from_text(
+            user_id=user_id,
+            thread_id=thread_id,
+            text=text,
+            message=message,
+            context=context,
+        )
+    ):
+        return True
+
     # A new window created from here is named after the topic, not the directory.
     requested_topic_names.remember_from_message(message)
 
-    all_windows = await tmux_manager.list_windows()
+    all_windows = await tmux_manager.list_windows() if config.bind_picker else []
     bound_ids = {bound_wid for _, _, bound_wid in thread_router.iter_thread_bindings()}
     bound_lookup = {canonical_window_id(wid) for wid in bound_ids}
     unbound = [
@@ -307,16 +342,18 @@ async def _handle_unbound_topic(
             user_data[PENDING_THREAD_ID] = thread_id
             user_data[PENDING_THREAD_TEXT] = text
         await safe_reply(message, msg_text, reply_markup=keyboard)
-        await safe_reply(message, PENDING_DELIVERY_NOTICE)
+        if text:
+            await safe_reply(message, PENDING_DELIVERY_NOTICE)
         return True
 
-    # No unbound windows — show directory browser to create a new session
+    # Nothing parsed — fall back to the directory browser (still one screen
+    # per level, but rooted at the projects root and limited to git checkouts).
     logger.info(
         "Unbound topic: showing directory browser (user=%d, thread=%d)",
         user_id,
         thread_id,
     )
-    start_path = str(Path.cwd())
+    start_path = _browser_start_path()
     msg_text, keyboard, subdirs = build_directory_browser(start_path, user_id=user_id)
     if user_data is not None:
         user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
@@ -326,7 +363,8 @@ async def _handle_unbound_topic(
         user_data[PENDING_THREAD_ID] = thread_id
         user_data[PENDING_THREAD_TEXT] = text
     await safe_reply(message, msg_text, reply_markup=keyboard)
-    await safe_reply(message, PENDING_DELIVERY_NOTICE)
+    if text:
+        await safe_reply(message, PENDING_DELIVERY_NOTICE)
     return True
 
 
@@ -337,6 +375,8 @@ async def _handle_dead_window(
     text: str,
     user_data: dict | None,
     message: Message,
+    *,
+    adapter: TelegramSessionAdapter,
 ) -> bool:
     """Show recovery UI or directory browser for a dead (killed) window.
 
@@ -401,11 +441,12 @@ async def _handle_dead_window(
             )
             return True
 
-        returned_to_shell = await discover_and_register_transcript(window_id, _window=w)
+        returned_to_shell = await discover_and_register_transcript(
+            window_id, _window=w, adapter=adapter
+        )
 
     if w is not None and not returned_to_shell:
         lifecycle_strategy.clear_dead_notification(user_id, thread_id)
-        lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
         return False
 
     logically_dead = (
@@ -413,7 +454,6 @@ async def _handle_dead_window(
         or returned_to_shell
     )
     if w and not logically_dead:
-        lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
         return False
 
     display = thread_router.get_display_name(window_id)
@@ -436,7 +476,7 @@ async def _handle_dead_window(
             cleanup_eligible=True,
         )
         lifecycle_strategy.clear_dead_notification(user_id, thread_id)
-        start_path = str(Path.cwd())
+        start_path = _browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, user_id=user_id
         )
@@ -478,6 +518,81 @@ async def _handle_dead_window(
     return True
 
 
+async def _dismiss_interactive_prompt(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    chat_id: int,
+    text: str,
+    message: Message,
+    adapter,
+) -> bool:
+    """Dismiss the topic's interactive prompt; True when safe to forward.
+
+    Sends Escape to the pane that OWNS the prompt (window-level keys hit
+    the active pane, which in a multi-pane window can be a different
+    agent), confirms the dismissal by re-reading that pane with the
+    poller's own detector (a fixed sleep is not confirmation), and only
+    then clears the tracking. On a failed send, an exception, or a
+    prompt that never goes away, the tracking stays, nothing is
+    forwarded, and the notice echoes the text so it is never lost.
+    """
+    # Lazy: interactive imports pull PTB types
+    from ..interactive import (
+        clear_interactive_mode,
+        get_interactive_pane,
+        pane_has_interactive_prompt,
+    )
+
+    pane_id = get_interactive_pane(user_id, thread_id, chat_id=chat_id)
+    expected_prompt = get_interactive_prompt_fingerprint(
+        user_id, thread_id, chat_id, message.message_id
+    )
+    escape_sent = False
+    try:
+        escape_sent, _ = await adapter.send_keys(
+            window_id,
+            ["Escape"],
+            pane_id=pane_id,
+            action_id=f"telegram-message:{chat_id}:{message.message_id}:dismiss",
+            expected_prompt=expected_prompt,
+        )
+    except Exception:  # noqa: BLE001  # escape failure is handled below
+        escape_sent = False
+
+    if escape_sent:
+        # The forwarded text lands on the ACTIVE pane (window-level send),
+        # so confirmation must cover BOTH panes: the one that owned the
+        # prompt we just dismissed and the active one, which may hold a
+        # second prompt the sibling scan surfaced earlier. An unreadable
+        # pane (PromptStateError) proves nothing and never confirms.
+        # Lazy: interactive imports pull PTB types
+        from ..interactive.interactive_ui import PromptStateError
+
+        for _ in range(_DISMISS_CONFIRM_ATTEMPTS):
+            await asyncio.sleep(_DISMISS_CONFIRM_INTERVAL_S)
+            try:
+                owner_clear = not await pane_has_interactive_prompt(window_id, pane_id)
+                active_clear = (
+                    owner_clear
+                    if pane_id is None
+                    else not await pane_has_interactive_prompt(window_id, None)
+                )
+            except PromptStateError:
+                continue
+            if owner_clear and active_clear:
+                clear_interactive_mode(user_id, thread_id, chat_id=chat_id)
+                return True
+
+    await safe_reply(
+        message,
+        "\u26a0\ufe0f Could not dismiss the interactive prompt, so your "
+        f"text was NOT forwarded: {text}\nRetry in a moment, or answer "
+        "the prompt's buttons directly.",
+    )
+    return False
+
+
 async def _forward_message(
     window_id: str,
     user_id: int,
@@ -485,9 +600,12 @@ async def _forward_message(
     text: str,
     client: TelegramClient,
     message: Message,
+    adapter,
 ) -> None:
     """Forward a text message to the bound tmux window."""
-    await message.chat.send_action(ChatAction.TYPING)  # type: ignore[union-attr]
+    # Best-effort: a network error here must not drop the user's text (#257).
+    with contextlib.suppress(TelegramError):
+        await message.chat.send_action(ChatAction.TYPING)  # type: ignore[union-attr]
     # Enqueue a status clear to actually delete the Telegram message
     # (clear_status_msg_info only clears the tracking dict, leaving a ghost)
     await enqueue_status_update(client, user_id, window_id, None, thread_id)
@@ -497,12 +615,56 @@ async def _forward_message(
 
     lifecycle_strategy.clear_probe_failures(window_id)
 
+    # If in interactive mode, the terminal likely has a modal prompt
+    # (AskUserQuestion / ExitPlanMode) that would swallow plain text or
+    # treat it as an answer. Dismiss it, CONFIRM the dismissal by
+    # re-reading the owning pane with the poller's own detector, and
+    # only then deliver the text. A fixed sleep is not confirmation:
+    # on a failed Escape send, an exception, or a prompt that never
+    # goes away, the interactive tracking stays, the text is NOT
+    # forwarded, and the notice echoes the text back so it is never
+    # lost (2026-09-24: silently discarding trapped voice-transcript
+    # users in a dismissal loop; 2026-09-25 review: silently
+    # FORWARDING after an unconfirmed dismissal is the same bug
+    # mirrored).
+    telegram_adapter = adapter
+    action_id = f"telegram-message:{message.chat.id}:{message.message_id}"
+    interactive_window = get_interactive_window(
+        user_id, thread_id, chat_id=message.chat.id
+    )
+    interactive_dismissed = False
+    if interactive_window and interactive_window == window_id:
+        if not await _dismiss_interactive_prompt(
+            user_id,
+            thread_id,
+            window_id,
+            message.chat.id,
+            text,
+            message,
+            telegram_adapter,
+        ):
+            return
+        interactive_dismissed = True
+
     success, err_message = await send_telegram_to_window(
-        user_id, window_id, thread_id, text, message.chat.id
+        user_id,
+        window_id,
+        thread_id,
+        text,
+        message.chat.id,
+        adapter=telegram_adapter,
+        action_id=action_id,
     )
     if not success:
         await safe_reply(message, f"\u274c {err_message}")
         return
+
+    if interactive_dismissed:
+        await safe_reply(
+            message,
+            "\u26a1 Interactive prompt dismissed (verified). Your message "
+            "was delivered to the agent.",
+        )
 
     await ack_reaction(client, message.chat.id, message.message_id)
 
@@ -519,16 +681,6 @@ async def _forward_message(
         )
         task.add_done_callback(task_done_callback)
         _bash_capture_tasks[(user_id, thread_id)] = task
-
-    # If in interactive mode, refresh the UI after sending text
-    interactive_window = get_interactive_window(
-        user_id, thread_id, chat_id=message.chat.id
-    )
-    if interactive_window and interactive_window == window_id:
-        await asyncio.sleep(0.2)
-        await handle_interactive_ui(
-            client, user_id, window_id, thread_id, chat_id=message.chat.id
-        )
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -551,6 +703,59 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await handle_text_message(update, context)
 
 
+async def _handle_menu_reply(
+    user_id: int,
+    thread_id: int | None,
+    text: str,
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    # Lazy: menu rendering imports handlers during callback registration.
+    from ..interactive.pi_controls import (
+        MENU_EXPIRED,
+        is_menu_reply,
+    )
+
+    if not is_menu_reply(message):
+        return False
+    # Lazy: callback dispatch shares the renderer; load only for actual menu input.
+    from ..interactive.interactive_callbacks import handle_menu_reply
+
+    # A retired menu reply is never a new session plan, a rename, or shell input.
+    window_id = (
+        thread_router.get_window_for_thread(user_id, thread_id, message.chat.id)
+        if thread_id is not None
+        else None
+    )
+    if thread_id is None or window_id is None:
+        await safe_reply(message, MENU_EXPIRED)
+        return True
+    await handle_menu_reply(
+        PTBTelegramClient(context.bot),
+        user_id,
+        window_id,
+        thread_id,
+        text,
+        message,
+        protocol_adapter_for(context.bot_data),
+    )
+    return True
+
+
+async def _reply_without_topic(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, message: Message
+) -> None:
+    if update.effective_chat and is_general_topic(message):
+        await handle_general_topic_message(
+            context.bot, message, update.effective_chat.id
+        )
+    else:
+        await safe_reply(
+            message,
+            "\u274c Please use a named topic. Create a new topic to start a session.",
+        )
+
+
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -565,6 +770,9 @@ async def handle_text_message(
 
     text = message.text
     thread_id = _get_thread_id(update)
+
+    if await _handle_menu_reply(user.id, thread_id, text, message, context):
+        return
 
     # Store group chat_id for forum topic message routing
     chat = message.chat
@@ -586,20 +794,12 @@ async def handle_text_message(
 
     # Must be in a named topic
     if thread_id is None:
-        if message and update.effective_chat and is_general_topic(message):
-            await handle_general_topic_message(
-                context.bot, message, update.effective_chat.id
-            )
-        else:
-            await safe_reply(
-                message,
-                "\u274c Please use a named topic. Create a new topic to start a session.",
-            )
+        await _reply_without_topic(update, context, message)
         return
 
-    # Unbound topic — show picker or browser
+    # Unbound topic — typed plan, picker, or browser
     if await _handle_unbound_topic(
-        user.id, thread_id, text, context.user_data, message
+        user.id, thread_id, text, context.user_data, message, context
     ):
         return
 
@@ -608,7 +808,13 @@ async def handle_text_message(
     assert window_id is not None  # _handle_unbound_topic returned False
 
     if await _handle_dead_window(
-        window_id, user.id, thread_id, text, context.user_data, message
+        window_id,
+        user.id,
+        thread_id,
+        text,
+        context.user_data,
+        message,
+        adapter=protocol_adapter_for(context.bot_data),
     ):
         return
 
@@ -620,6 +826,9 @@ async def handle_text_message(
         # Lazy: shell.shell_commands ↔ text_handler via approval callback.
         from ..shell.shell_commands import handle_shell_message
 
+        # Lazy: only a bound shell route needs the protocol backend/provider graph.
+        from ...session_protocol.telegram import adapter_for
+
         await handle_shell_message(
             PTBTelegramClient(context.bot),
             user.id,
@@ -627,10 +836,15 @@ async def handle_text_message(
             window_id,
             text,
             message,
+            adapter=adapter_for(context.bot_data),
         )
         return
 
     # Forward message to window
+    # Lazy: unbound and recovery paths return above without loading the protocol
+    # backend; import it only when a message will reach the session.
+    from ...session_protocol.telegram import adapter_for
+
     await _forward_message(
         window_id,
         user.id,
@@ -638,4 +852,5 @@ async def handle_text_message(
         text,
         PTBTelegramClient(context.bot),
         message,
+        adapter_for(context.bot_data),
     )

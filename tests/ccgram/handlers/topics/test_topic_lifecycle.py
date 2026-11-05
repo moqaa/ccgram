@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from telegram import Bot
@@ -11,7 +11,6 @@ from ccgram.window_view import WindowView
 
 from ccgram.handlers.topics.topic_lifecycle import (
     PROBE_MAX_PER_CYCLE,
-    check_autoclose_timers,
     check_unbound_window_ttl,
     probe_topic_existence,
     prune_stale_state,
@@ -58,75 +57,6 @@ class TestLegacyHerdrMigration:
             assert rollback_legacy_herdr_binding(1, 100, "w2:t1") is False
 
 
-class TestCheckAutocloseTimers:
-    async def test_no_topics_is_noop(self):
-        bot = AsyncMock(spec=Bot)
-        await check_autoclose_timers(bot)
-        bot.close_forum_topic.assert_not_called()
-        bot.delete_forum_topic.assert_not_called()
-
-    async def test_expired_done_topic_is_closed_not_deleted(self):
-        """Autoclose closes the topic; it never deletes (irreversible data loss)."""
-        bot = AsyncMock(spec=Bot)
-        user_id, thread_id = 1, 100
-        lifecycle_strategy.start_autoclose_timer(
-            user_id, thread_id, "done", time.monotonic() - 99999
-        )
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch(
-                "ccgram.handlers.topics.topic_lifecycle.thread_router"
-            ) as mock_router,
-            patch(
-                "ccgram.handlers.topics.topic_lifecycle.clear_topic_state",
-                new_callable=AsyncMock,
-            ),
-        ):
-            mock_config.autoclose_done_minutes = 1
-            mock_router.resolve_chat_id.return_value = 42
-            mock_router.get_window_for_thread.return_value = "@0"
-            await check_autoclose_timers(bot)
-        bot.close_forum_topic.assert_called_once()
-        bot.delete_forum_topic.assert_not_called()
-
-    async def test_not_yet_expired_topic_stays(self):
-        bot = AsyncMock(spec=Bot)
-        user_id, thread_id = 1, 100
-        lifecycle_strategy.start_autoclose_timer(
-            user_id, thread_id, "done", time.monotonic()
-        )
-        with patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config:
-            mock_config.autoclose_done_minutes = 60
-            await check_autoclose_timers(bot)
-        bot.close_forum_topic.assert_not_called()
-        bot.delete_forum_topic.assert_not_called()
-
-    async def test_expired_dead_topic_stays_when_window_is_live(self):
-        bot = AsyncMock(spec=Bot)
-        user_id, thread_id = 1, 100
-        lifecycle_strategy.start_autoclose_timer(
-            user_id, thread_id, "dead", time.monotonic() - 99999
-        )
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch(
-                "ccgram.handlers.topics.topic_lifecycle.thread_router"
-            ) as mock_router,
-            patch("ccgram.handlers.topics.topic_lifecycle.tmux_manager") as mock_tmux,
-        ):
-            mock_config.autoclose_done_minutes = 30
-            mock_config.autoclose_dead_minutes = 10
-            mock_config.delete_dead_topics = False  # opt-in; a MagicMock is truthy
-            mock_router.get_window_for_thread.return_value = "@0"
-            mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
-            mock_tmux.list_windows_for_reconciliation = AsyncMock(
-                return_value=[WindowRef(window_id="@1", window_name="p", cwd="/p")]
-            )
-            await check_autoclose_timers(bot)
-        bot.delete_forum_topic.assert_not_called()
-        assert lifecycle_strategy.get_state(user_id, thread_id).autoclose is None
-
-
 HERDR_TARGET = "herdr-session-v1-" + "a" * 64
 
 
@@ -147,7 +77,7 @@ def _window_view(origin: str, window_id: str = "@0") -> WindowView:
 
 @dataclass
 class _TtlSweep:
-    mux: MagicMock
+    adapter: MagicMock
     revoke: MagicMock
     unbound_timer: float | None
 
@@ -167,16 +97,18 @@ async def _sweep_expired_unbound_window(
         patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
         patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_router,
         patch("ccgram.handlers.topics.topic_lifecycle.window_query") as mock_wq,
-        patch("ccgram.handlers.topics.topic_lifecycle.tmux_manager") as mock_tmux,
         patch("ccgram.handlers.topics.topic_lifecycle.revoke_window_tokens") as revoke,
     ):
-        mock_config.autoclose_done_minutes = 1
+        mock_config.unbound_window_ttl_minutes = 1
         mock_router.iter_thread_bindings.return_value = bindings or []
         mock_wq.view_window.return_value = _window_view(origin, window_id)
-        mock_tmux.kill_window = AsyncMock(return_value=kill_ok)
-        await check_unbound_window_ttl([window])
+        adapter = MagicMock()
+        adapter.close = AsyncMock(
+            return_value=(kill_ok, "closed" if kill_ok else "failed")
+        )
+        await check_unbound_window_ttl([window], adapter=adapter)
     return _TtlSweep(
-        mux=mock_tmux,
+        adapter=adapter,
         revoke=revoke,
         unbound_timer=terminal_poll_state.get_state(window_id).unbound_timer,
     )
@@ -185,18 +117,18 @@ async def _sweep_expired_unbound_window(
 class TestCheckUnboundWindowTtl:
     async def test_no_timeout_is_noop(self):
         with patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config:
-            mock_config.autoclose_done_minutes = 0
-            await check_unbound_window_ttl([])
+            mock_config.unbound_window_ttl_minutes = 0
+            await check_unbound_window_ttl([], adapter=MagicMock())
 
     async def test_bound_window_timer_cleared(self):
         sweep = await _sweep_expired_unbound_window(bindings=[(1, 100, "@0")])
         assert sweep.unbound_timer is None
-        sweep.mux.kill_window.assert_not_called()
+        sweep.adapter.close.assert_not_awaited()
 
     async def test_manually_discovered_window_is_not_killed(self):
         sweep = await _sweep_expired_unbound_window(origin="manual_discovered")
         assert sweep.unbound_timer is None
-        sweep.mux.kill_window.assert_not_called()
+        sweep.adapter.close.assert_not_awaited()
 
     @pytest.mark.parametrize(
         "window_id",
@@ -207,7 +139,7 @@ class TestCheckUnboundWindowTtl:
         self, window_id: str
     ):
         sweep = await _sweep_expired_unbound_window(window_id)
-        sweep.mux.kill_window.assert_called_once_with(window_id)
+        sweep.adapter.close.assert_awaited_once_with(window_id)
         sweep.revoke.assert_called_once_with(window_id)
 
     async def test_failed_kill_keeps_tokens_alive(self):
@@ -242,6 +174,8 @@ class TestProbeTopicExistence:
         bot.unpin_all_forum_topic_messages = AsyncMock(
             side_effect=BadRequest("Topic_id_invalid")
         )
+        adapter = MagicMock()
+        adapter.close = AsyncMock(return_value=(True, "closed"))
         with (
             patch(
                 "ccgram.handlers.topics.topic_lifecycle.thread_router"
@@ -260,15 +194,15 @@ class TestProbeTopicExistence:
             )
             mock_wq.view_window.return_value = _window_view(origin, window_id)
             mock_tmux.kill_window = AsyncMock()
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, adapter)
 
         mock_router.unbind_thread.assert_called_once_with(
             1, 100, chat_id=42, retirement_reason="remote_deleted"
         )
         if expect_kill:
-            mock_tmux.kill_window.assert_called_once_with(window_id)
+            adapter.close.assert_awaited_once_with(window_id)
         else:
-            mock_tmux.kill_window.assert_not_called()
+            adapter.close.assert_not_awaited()
 
     async def test_flood_control_backs_off_without_suspending(self):
         """RetryAfter is chat-wide: it must not disable deleted-topic detection."""
@@ -287,7 +221,7 @@ class TestProbeTopicExistence:
             mock_router.resolve_chat_id.return_value = 42
             mock_strategy.should_skip_probe.return_value = False
 
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
             bot.unpin_all_forum_topic_messages.assert_awaited_once_with(
                 chat_id=42,
                 message_thread_id=100,
@@ -297,17 +231,17 @@ class TestProbeTopicExistence:
 
             # Whole pass is paused while the chat is flood-limited.
             bot.unpin_all_forum_topic_messages.reset_mock()
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
             bot.unpin_all_forum_topic_messages.assert_not_called()
 
             # Clearing Telegram's short delay does not spend another admin
             # request before the normal five-minute probe interval.
             tl._probe_backoff_until[42] = 0.0
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
             bot.unpin_all_forum_topic_messages.assert_not_called()
 
             mock_time.return_value = 100.0 + tl.PROBE_INTERVAL
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
             bot.unpin_all_forum_topic_messages.assert_called_once()
 
     async def test_flood_control_is_scoped_to_the_affected_chat(self):
@@ -326,7 +260,7 @@ class TestProbeTopicExistence:
             patch.object(tl.time, "monotonic", return_value=100.0) as mock_time,
         ):
             mock_router.iter_thread_bindings_with_chat.return_value = bindings
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
 
             assert bot.unpin_all_forum_topic_messages.call_count == 2
             assert (
@@ -339,18 +273,18 @@ class TestProbeTopicExistence:
             )
 
             bot.unpin_all_forum_topic_messages.reset_mock()
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
             bot.unpin_all_forum_topic_messages.assert_not_called()
 
             # Thread IDs are chat-local. Clearing chat 42's short backoff still
             # preserves the normal probe interval for its failed topic.
             tl._probe_backoff_until[42] = 0.0
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
             bot.unpin_all_forum_topic_messages.assert_not_called()
 
             tl._probe_last_ts[(1, 43, 100)] = 200.0
             mock_time.return_value = 100.0 + tl.PROBE_INTERVAL
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
             bot.unpin_all_forum_topic_messages.assert_called_once()
             assert bot.unpin_all_forum_topic_messages.call_args.kwargs["chat_id"] == 42
 
@@ -366,7 +300,7 @@ class TestProbeTopicExistence:
             "ccgram.handlers.topics.topic_lifecycle.thread_router"
         ) as mock_router:
             mock_router.iter_thread_bindings_with_chat.return_value = bindings
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
 
         assert bot.unpin_all_forum_topic_messages.call_count == 2
         assert {
@@ -389,7 +323,7 @@ class TestProbeTopicExistence:
         ):
             mock_router.iter_thread_bindings.return_value = [(1, 100, "@0")]
             mock_router.resolve_chat_id.return_value = 42
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
 
         bot.unpin_all_forum_topic_messages.assert_called_once()
 
@@ -408,7 +342,7 @@ class TestProbeTopicExistence:
             probed = []
             for _ in range(3):
                 bot.unpin_all_forum_topic_messages.reset_mock()
-                await probe_topic_existence(bot)
+                await probe_topic_existence(bot, MagicMock())
                 assert (
                     bot.unpin_all_forum_topic_messages.call_count == PROBE_MAX_PER_CYCLE
                 )
@@ -434,7 +368,7 @@ class TestProbeTopicExistence:
                     (1, 300, "@live"),
                 ]
                 mock_router.resolve_chat_id.return_value = 42
-                await probe_topic_existence(bot)
+                await probe_topic_existence(bot, MagicMock())
         finally:
             tl._probe_pin_disabled.difference_update(blocked)
 
@@ -452,7 +386,7 @@ class TestProbeTopicExistence:
             "ccgram.handlers.topics.topic_lifecycle.thread_router"
         ) as mock_router:
             mock_router.iter_thread_bindings.return_value = [(1, 100, "@0")]
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         bot.unpin_all_forum_topic_messages.assert_not_called()
 
     async def test_missing_pin_rights_disables_probe_without_suspending(self):
@@ -474,7 +408,7 @@ class TestProbeTopicExistence:
                 mock_router.resolve_chat_id.return_value = 42
                 mock_strategy.should_skip_probe.return_value = False
 
-                await probe_topic_existence(bot)
+                await probe_topic_existence(bot, MagicMock())
 
                 # Permission error must not count as a probe failure (no suspend).
                 mock_strategy.record_probe_failure.assert_not_called()
@@ -482,141 +416,19 @@ class TestProbeTopicExistence:
 
                 # Next tick skips the window entirely — no further API call.
                 bot.unpin_all_forum_topic_messages.reset_mock()
-                await probe_topic_existence(bot)
+                await probe_topic_existence(bot, MagicMock())
                 bot.unpin_all_forum_topic_messages.assert_not_called()
         finally:
             tl._probe_pin_disabled.discard(wid)
-
-
-class TestAutocloseNeedsConfirmedDeath:
-    """An unreachable backend must not close the user's topic.
-
-    find_window_by_id answers None for a window that is gone and for a backend
-    that could not be reached, and this path closes a forum topic on that
-    answer. Unknown defers to the next expiry.
-    """
-
-    async def test_unreachable_backend_defers_the_close(self) -> None:
-        from ccgram.handlers.topics.topic_lifecycle import _close_expired_topic
-
-        client = AsyncMock()
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.tmux_manager") as mock_tmux,
-            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
-            patch(
-                "ccgram.handlers.topics.topic_lifecycle.lifecycle_strategy"
-            ) as strategy,
-            patch("ccgram.handlers.topics.topic_lifecycle.window_query") as wq,
-        ):
-            mock_tr.iter_thread_bindings_with_chat.return_value = [
-                (100, -100200, 42, "@1")
-            ]
-            mock_tr.get_window_for_thread.return_value = "@1"
-            wq.view_window.return_value = MagicMock(state="dead")
-            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
-            mock_tmux.list_windows_for_reconciliation = AsyncMock(return_value=None)
-
-            await _close_expired_topic(client, 100, 42, "dead")
-
-        client.close_forum_topic.assert_not_called()
-        strategy.clear_autoclose_timer.assert_not_called()
-
-
-class TestDeleteDeadTopics:
-    """CCGRAM_DELETE_DEAD_TOPICS: a topic whose window is confirmed gone is deleted.
-
-    Closing leaves a locked topic behind for every window that ever died, and
-    /sync never cleans those (they retire as not cleanup-eligible). Opt-in only:
-    deletion is irreversible. Done topics and live windows are never deleted.
-    """
-
-    async def _expire(
-        self, state: str, *, delete_dead: bool, present: bool | None = False
-    ) -> tuple[AsyncMock, MagicMock]:
-        from ccgram.handlers.topics.topic_lifecycle import _close_expired_topic
-
-        client = AsyncMock()
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
-            patch(
-                "ccgram.handlers.topics.topic_lifecycle.clear_topic_state",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "ccgram.multiplexer.reconciliation.window_presence",
-                new_callable=AsyncMock,
-                return_value=present,
-            ),
-        ):
-            mock_config.delete_dead_topics = delete_dead
-            mock_tr.iter_thread_bindings_with_chat.return_value = [
-                (100, -100200, 42, "@1")
-            ]
-            mock_tr.get_window_for_thread.return_value = "@1"
-            await _close_expired_topic(client, 100, 42, state)
-        return client, mock_tr
-
-    async def test_dead_window_topic_is_deleted_when_enabled(self) -> None:
-        client, router = await self._expire("dead", delete_dead=True)
-        client.delete_forum_topic.assert_awaited_once_with(
-            chat_id=-100200, message_thread_id=42
-        )
-        client.close_forum_topic.assert_not_called()
-        router.unbind_thread.assert_called_once()
-
-    async def test_dead_window_topic_is_only_closed_by_default(self) -> None:
-        client, _ = await self._expire("dead", delete_dead=False)
-        client.close_forum_topic.assert_awaited_once()
-        client.delete_forum_topic.assert_not_called()
-
-    async def test_done_topic_is_never_deleted(self) -> None:
-        client, _ = await self._expire("done", delete_dead=True)
-        client.close_forum_topic.assert_awaited_once()
-        client.delete_forum_topic.assert_not_called()
-
-    async def test_live_window_topic_is_never_deleted(self) -> None:
-        client, router = await self._expire("dead", delete_dead=True, present=True)
-        client.delete_forum_topic.assert_not_called()
-        client.close_forum_topic.assert_not_called()
-        router.unbind_thread.assert_not_called()
-
-    async def test_failed_delete_falls_back_to_close(self) -> None:
-        from ccgram.handlers.topics.topic_lifecycle import _close_expired_topic
-
-        client = AsyncMock()
-        client.delete_forum_topic.side_effect = BadRequest("Not enough rights")
-        with (
-            patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr,
-            patch(
-                "ccgram.handlers.topics.topic_lifecycle.clear_topic_state",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "ccgram.multiplexer.reconciliation.window_presence",
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-        ):
-            mock_config.delete_dead_topics = True
-            mock_tr.iter_thread_bindings_with_chat.return_value = [
-                (100, -100200, 42, "@1")
-            ]
-            mock_tr.get_window_for_thread.return_value = "@1"
-            await _close_expired_topic(client, 100, 42, "dead")
-        client.close_forum_topic.assert_awaited_once_with(
-            chat_id=-100200, message_thread_id=42
-        )
-        mock_tr.unbind_thread.assert_called_once()
 
 
 class TestAgentlessTopics:
     """CCGRAM_AGENTLESS_TOPIC_MINUTES: a topic exists only while an agent runs.
 
     A window that is still open but whose agent has exited (a bare shell) keeps
-    its topic forever otherwise: the dead timer clears itself when the window is
-    present. Agent liveness is the hook-maintained session_map entry.
+    its topic forever otherwise: dead-session cleanup only covers windows that
+    are gone. Agent liveness is the hook-maintained session_map entry. Removal
+    goes through ``retire_topic_binding`` so failures are retried by the drain.
     """
 
     @pytest.fixture(autouse=True)
@@ -634,12 +446,13 @@ class TestAgentlessTopics:
         agents: frozenset[str] | set[str] | None = frozenset(),
         live: tuple[str, ...] = ("@1",),
         elapsed: tuple[float, ...] = (0.0, 601.0),
-        client: AsyncMock | None = None,
-    ) -> tuple[AsyncMock, MagicMock, AsyncMock]:
+        outcome: str = "deleted",
+        chat_id: int | None = -100200,
+    ) -> tuple[AsyncMock, AsyncMock, AsyncMock]:
         """Run one sweep per entry in *elapsed* (seconds on the monotonic clock)."""
         from ccgram.handlers.topics.topic_lifecycle import check_agentless_topics
 
-        client = client or AsyncMock()
+        client = AsyncMock()
         windows = [WindowRef(window_id=w, window_name="w", cwd="/p") for w in live]
         with (
             patch("ccgram.handlers.topics.topic_lifecycle.config") as mock_config,
@@ -650,6 +463,11 @@ class TestAgentlessTopics:
                 new_callable=AsyncMock,
             ) as clear,
             patch(
+                "ccgram.handlers.topics.topic_deletion.retire_topic_binding",
+                new_callable=AsyncMock,
+                return_value=outcome,
+            ) as retire,
+            patch(
                 "ccgram.handlers.topics.topic_lifecycle._agent_window_ids",
                 new_callable=AsyncMock,
                 return_value=None if agents is None else set(agents),
@@ -657,38 +475,43 @@ class TestAgentlessTopics:
         ):
             mock_config.agentless_topic_minutes = minutes
             mock_tr.iter_thread_bindings_with_chat.return_value = [
-                (100, -100200, 42, "@1")
+                (100, chat_id, 42, "@1")
             ]
             for now in elapsed:
                 mock_time.monotonic.return_value = now
                 await check_agentless_topics(client, windows)
-        return client, mock_tr, clear
+            # Run the pre-delete hook the way retire_topic_binding would.
+            if retire.await_args is not None:
+                await retire.await_args.kwargs["before_delete"]()
+        return client, retire, clear
 
-    async def test_topic_of_agentless_window_is_deleted_after_the_grace(self) -> None:
-        client, router, clear = await self._sweep()
-        client.delete_forum_topic.assert_awaited_once_with(
-            chat_id=-100200, message_thread_id=42
-        )
-        router.unbind_thread.assert_called_once_with(
-            100, 42, chat_id=-100200, retirement_reason="remote_closed"
+    async def test_topic_of_agentless_window_is_retired_after_the_grace(self) -> None:
+        client, retire, clear = await self._sweep()
+        retire.assert_awaited_once_with(
+            client,
+            100,
+            42,
+            "@1",
+            chat_id=-100200,
+            before_delete=ANY,
+            retirement_reason="agentless",
         )
         # The window is alive: window-dead cleanup must not run for it.
         assert clear.await_args is not None
         assert clear.await_args.kwargs["window_dead"] is False
+        assert clear.await_args.kwargs["chat_id"] == -100200
 
-    async def test_nothing_is_deleted_within_the_grace(self) -> None:
-        client, router, _ = await self._sweep(elapsed=(0.0, 599.0))
-        client.delete_forum_topic.assert_not_called()
-        router.unbind_thread.assert_not_called()
+    async def test_nothing_is_retired_within_the_grace(self) -> None:
+        _, retire, _ = await self._sweep(elapsed=(0.0, 599.0))
+        retire.assert_not_awaited()
 
     async def test_first_sight_only_starts_the_clock(self) -> None:
-        client, _, _ = await self._sweep(elapsed=(99999.0,))
-        client.delete_forum_topic.assert_not_called()
+        _, retire, _ = await self._sweep(elapsed=(99999.0,))
+        retire.assert_not_awaited()
 
     async def test_window_running_an_agent_keeps_its_topic(self) -> None:
-        client, router, _ = await self._sweep(agents={"@1"})
-        client.delete_forum_topic.assert_not_called()
-        router.unbind_thread.assert_not_called()
+        _, retire, _ = await self._sweep(agents={"@1"})
+        retire.assert_not_awaited()
 
     async def test_agent_returning_resets_the_clock(self) -> None:
         from ccgram.handlers.topics import topic_lifecycle
@@ -697,32 +520,40 @@ class TestAgentlessTopics:
         assert topic_lifecycle._agentless_since
         await self._sweep(agents={"@1"}, elapsed=(300.0,))
         assert not topic_lifecycle._agentless_since
-        client, _, _ = await self._sweep(elapsed=(601.0,))
-        client.delete_forum_topic.assert_not_called()
+        _, retire, _ = await self._sweep(elapsed=(601.0,))
+        retire.assert_not_awaited()
 
     async def test_missing_window_is_left_to_the_dead_path(self) -> None:
-        client, router, _ = await self._sweep(live=("@9",))
-        client.delete_forum_topic.assert_not_called()
-        router.unbind_thread.assert_not_called()
+        _, retire, _ = await self._sweep(live=("@9",))
+        retire.assert_not_awaited()
 
     async def test_unreadable_session_map_defers(self) -> None:
-        client, router, _ = await self._sweep(agents=None)
-        client.delete_forum_topic.assert_not_called()
-        router.unbind_thread.assert_not_called()
+        _, retire, _ = await self._sweep(agents=None)
+        retire.assert_not_awaited()
 
     async def test_off_by_default(self) -> None:
-        client, router, _ = await self._sweep(minutes=0)
-        client.delete_forum_topic.assert_not_called()
-        router.unbind_thread.assert_not_called()
+        _, retire, _ = await self._sweep(minutes=0)
+        retire.assert_not_awaited()
 
-    async def test_refused_delete_falls_back_to_close(self) -> None:
-        client = AsyncMock()
-        client.delete_forum_topic.side_effect = BadRequest("Not enough rights")
-        client, router, _ = await self._sweep(client=client)
-        client.close_forum_topic.assert_awaited_once_with(
-            chat_id=-100200, message_thread_id=42
-        )
-        router.unbind_thread.assert_called_once()
+    async def test_binding_without_a_chat_is_skipped(self) -> None:
+        _, retire, _ = await self._sweep(chat_id=None)
+        retire.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("outcome", "clock_kept"),
+        [
+            pytest.param("deleted", False, id="deleted"),
+            pytest.param("failed", False, id="failed-left-to-the-drain"),
+            pytest.param("protected_provisioning", True, id="protected-retries"),
+        ],
+    )
+    async def test_protected_outcome_keeps_the_clock(
+        self, outcome: str, clock_kept: bool
+    ) -> None:
+        from ccgram.handlers.topics import topic_lifecycle
+
+        await self._sweep(outcome=outcome)
+        assert bool(topic_lifecycle._agentless_since) is clock_kept
 
     async def test_agent_windows_come_from_the_session_map(self) -> None:
         from ccgram.handlers.topics.topic_lifecycle import _agent_window_ids
