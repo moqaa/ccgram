@@ -25,6 +25,13 @@ from .models import (
 if TYPE_CHECKING:
     from .service import LocalSessionService
 
+# Stop/permission/question hooks are deferred until the next protocol poll
+# (about a second). Input arriving in that window waits for the evidence to
+# settle instead of being refused; the checks then run on fresh state.
+HOOK_EVIDENCE_WAIT_SECONDS = 5.0
+_HOOK_EVIDENCE_POLL_SECONDS = 0.1
+_EVIDENCE_GATED_KINDS = frozenset({"message.send", "request.respond"})
+
 _MAX_KEYS = 32
 _MAX_ATTACHMENTS = 10
 
@@ -232,6 +239,8 @@ class ActionExecutor:
         store.reserve(action.id, fingerprint)
         attempted = False
         try:
+            # Wait outside the input lock so other input to the target is not held.
+            await self._await_hook_evidence(session_id, action)
             target, _ = await self.service.current(session_id)
             async with input_lock(target.id):
                 target = await self._preflight(
@@ -293,6 +302,21 @@ class ActionExecutor:
         self.service.hub.publish("action.updated", session_id, result)
         return result, 200
 
+    async def _await_hook_evidence(self, session_id: str, action: Action) -> None:
+        """Wait, bounded, for deferred hook evidence to be processed.
+
+        The protocol poll settles it within about a second. Evidence that never
+        settles (a lost hook) still refuses in ``_preflight`` after the wait.
+        """
+        if action.kind not in _EVIDENCE_GATED_KINDS:
+            return
+        deadline = time.monotonic() + HOOK_EVIDENCE_WAIT_SECONDS
+        while (
+            self.service.requests.has_deferred(session_id)
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(_HOOK_EVIDENCE_POLL_SECONDS)
+
     async def _preflight(
         self,
         session_id: str,
@@ -326,10 +350,9 @@ class ActionExecutor:
                 target.foreground_argv,
             ):
                 raise ProtocolError(409, "binding_conflict", "Session binding changed")
-        if action.kind in {
-            "message.send",
-            "request.respond",
-        } and self.service.requests.has_deferred(session_id):
+        if action.kind in _EVIDENCE_GATED_KINDS and self.service.requests.has_deferred(
+            session_id
+        ):
             raise ProtocolError(409, "request_open", "Hook evidence awaits processing")
         if action.kind == "request.respond":
             await self._validate_response(session_id, target, action)

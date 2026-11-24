@@ -185,3 +185,44 @@ def test_invalid_actions_are_rejected_at_boundary(change):
     }
     with pytest.raises(ProtocolError):
         parse_action(body)
+
+
+async def test_message_waits_for_hook_evidence_then_sends(service, backend):
+    # A Stop/permission hook is briefly deferred until the next protocol poll;
+    # a message arriving in that window waits for it instead of being refused.
+    session = (await service.list_sessions())[0]
+    service.requests.defer(session.id)
+    asyncio.get_running_loop().call_later(0.2, service.requests.resolve, session.id)
+    started = time.monotonic()
+    result, status = await service.execute(session.id, action())
+    assert result.outcome == "sent" and status == 200
+    assert backend.sent == [("text", "hello", True)]
+    assert time.monotonic() - started >= 0.15
+
+
+async def test_unresolved_hook_evidence_still_refuses_after_the_wait(
+    service, backend, monkeypatch
+):
+    monkeypatch.setattr(
+        "ccgram.session_protocol.actions.HOOK_EVIDENCE_WAIT_SECONDS", 0.2
+    )
+    session = (await service.list_sessions())[0]
+    service.requests.defer(session.id)
+    result, status = await service.execute(session.id, action())
+    assert status == 409 and result.error
+    assert result.error["code"] == "request_open"
+    assert result.error["message"] == "Hook evidence awaits processing"
+    assert backend.sent == []
+
+
+async def test_waiting_for_hook_evidence_keeps_the_open_prompt_guard(service, backend):
+    # After the evidence settles, the usual checks run on fresh state: a
+    # permission prompt that opened meanwhile still refuses a plain message.
+    backend.current_prompt = Prompt("Allow command?\n1. Yes\n2. No", "PermissionPrompt")
+    session = (await service.list_sessions())[0]
+    service.requests.defer(session.id)
+    asyncio.get_running_loop().call_later(0.1, service.requests.resolve, session.id)
+    result, status = await service.execute(session.id, action())
+    assert status == 409 and result.error and result.error["code"] == "request_open"
+    assert result.error["message"] != "Hook evidence awaits processing"
+    assert backend.sent == []

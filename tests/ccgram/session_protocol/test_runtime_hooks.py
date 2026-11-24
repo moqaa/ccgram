@@ -19,8 +19,12 @@ from ccgram.session_protocol.runtime import ProtocolRuntime
 
 @pytest.mark.parametrize("kind", ["request.respond", "message.send"])
 async def test_queued_hook_blocks_stale_actions_before_polling(
-    service, backend, store, kind
+    service, backend, store, kind, monkeypatch
 ):
+    # Unpolled evidence still refuses once the bounded wait runs out.
+    monkeypatch.setattr(
+        "ccgram.session_protocol.actions.HOOK_EVIDENCE_WAIT_SECONDS", 0.2
+    )
     session = (await service.list_sessions())[0]
     backend.current_prompt = Prompt("/tmp/file\n1. Yes\n2. No", "permission")
     service.requests.observe_hook(
