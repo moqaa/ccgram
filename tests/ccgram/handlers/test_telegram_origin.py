@@ -224,3 +224,16 @@ def test_different_words_are_not_matched() -> None:
     remember_telegram_injection(1, "@1", 42, "yo pago")
 
     assert consume_telegram_injection(1, "@1", 42, "yo no pago") is False
+
+
+def test_paste_wrapper_split_mid_word_still_matches() -> None:
+    # Seen 2026-11-25: a long voice transcript reached the transcript wrapped
+    # as a paste that closed mid-word, the rest typed after the closing tag,
+    # and came back to the topic as a 👤 echo.
+    remember_telegram_injection(1, "@1", 42, "first part of a long message")
+    transcript = (
+        '\n\n<pasted_content id="ab12">\nfirst part of a lo\n'
+        '</pasted_content id="ab12">\n\nng message'
+    )
+
+    assert consume_telegram_injection(1, "@1", 42, transcript)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import re
 import time
 
 from ..session_protocol.models import ProtocolError
@@ -21,6 +22,11 @@ class _PendingInjection:
     created_at: float
 
 
+# Claude Code records a long burst of typed input as a paste, wrapped in
+# <pasted_content id="..."> tags, and a burst can close mid-word with the rest
+# typed after the closing tag.
+_PASTE_TAG_RE = re.compile(r"</?pasted_content\b[^>]*>")
+
 _pending_injections: dict[
     tuple[int, int | None, str, int], deque[_PendingInjection]
 ] = {}
@@ -28,8 +34,9 @@ _pending_injections: dict[
 
 def _normalize(text: str) -> str:
     # Whitespace-blind: a line break or spacing lost on the way into the
-    # terminal must not turn the user's own message into a 👤 echo.
-    return "".join(text.split())
+    # terminal, or a paste wrapper added by the agent, must not turn the user's
+    # own message into a 👤 echo.
+    return "".join(_PASTE_TAG_RE.sub("", text).split())
 
 
 def _key(user_id: int, window_id: str, thread_id: int, chat_id: int | None):
