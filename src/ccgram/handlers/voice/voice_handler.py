@@ -17,8 +17,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from ...config import config
+from ...providers import get_provider_for_window
 from ...session_protocol.telegram import adapter_for
 from ...thread_router import thread_router
+from ...window_query import get_window_provider
 from ...whisper import get_transcriber
 from ...whisper.base import TranscriptionResult, WhisperTranscriber
 from ..callback_helpers import get_thread_id
@@ -139,6 +141,19 @@ async def _send_confirm_message(
         context.user_data.setdefault(VOICE_PENDING, {})[key] = text
 
 
+def _routes_to_shell(window_id: str) -> bool:
+    """Whether text sent to this window would run as a shell command.
+
+    Auto-send is for agent topics. In a shell topic a dictated sentence is
+    typed and executed (raw, when no LLM is configured), so the Send /
+    Discard confirmation stays there even with CCGRAM_VOICE_AUTOSEND on.
+    """
+    provider = get_provider_for_window(
+        window_id, provider_name=get_window_provider(window_id)
+    )
+    return bool(provider.capabilities.chat_first_command_path)
+
+
 async def _deliver_transcription(
     message: Message,
     text: str,
@@ -148,7 +163,7 @@ async def _deliver_transcription(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Present a transcription and optionally forward it without confirmation."""
-    if config.voice_autosend is not True:
+    if config.voice_autosend is not True or _routes_to_shell(window_id):
         await _send_confirm_message(message, text, context)
         return
 

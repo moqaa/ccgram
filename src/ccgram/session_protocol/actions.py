@@ -28,7 +28,9 @@ if TYPE_CHECKING:
 # Stop/permission/question hooks are deferred until the next protocol poll
 # (about a second). Input arriving in that window waits for the evidence to
 # settle instead of being refused; the checks then run on fresh state.
-HOOK_EVIDENCE_WAIT_SECONDS = 5.0
+# Hook evidence clears only when a protocol refresh completes, and a refresh
+# over ~50 windows takes several seconds, so the wait must outlast one.
+HOOK_EVIDENCE_WAIT_SECONDS = 15.0
 _HOOK_EVIDENCE_POLL_SECONDS = 0.1
 _EVIDENCE_GATED_KINDS = frozenset({"message.send", "request.respond"})
 

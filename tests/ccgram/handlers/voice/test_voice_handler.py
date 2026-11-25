@@ -101,6 +101,7 @@ class TestHandleVoiceMessage:
                 new_callable=AsyncMock,
                 return_value=b"fake audio bytes",
             ) as download,
+            patch(f"{_VH}._routes_to_shell", return_value=False) as routes_to_shell,
         ):
             config.is_user_allowed.return_value = True
             config.voice_autosend = False
@@ -114,6 +115,7 @@ class TestHandleVoiceMessage:
                 reply=reply,
                 download=download,
                 adapter=adapter_for.return_value,
+                routes_to_shell=routes_to_shell,
             )
 
     async def test_transcription_stores_pending_confirmation(
@@ -175,6 +177,22 @@ class TestHandleVoiceMessage:
             context,
         )
         assert context.user_data == {}
+
+    async def test_autosend_keeps_confirmation_in_shell_topics(
+        self, voice_env: SimpleNamespace
+    ) -> None:
+        """A dictated sentence must not run as a shell command unconfirmed."""
+        voice_env.config.voice_autosend = True
+        voice_env.routes_to_shell.return_value = True
+        context = MagicMock(user_data={})
+
+        with patch(
+            f"{_VH}._send_transcribed_text", new_callable=AsyncMock
+        ) as mock_send:
+            await voice_handler.handle_voice_message(_make_update(), context)
+
+        mock_send.assert_not_awaited()
+        assert context.user_data[VOICE_PENDING][(_CHAT_ID, 1)] == _TRANSCRIPT
 
     async def test_autosend_stops_if_transcription_cannot_be_posted(
         self, voice_env: SimpleNamespace
@@ -519,3 +537,13 @@ class TestHandleVoiceCallback:
             "❌ Failed to send", show_alert=True
         )
         callback_env.send_to_window.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "expected"), [("shell", True), ("claude", False)]
+)
+def test_routes_to_shell_follows_the_window_provider(
+    provider_name: str, expected: bool
+) -> None:
+    with patch(f"{_VH}.get_window_provider", return_value=provider_name):
+        assert voice_handler._routes_to_shell("@0") is expected
