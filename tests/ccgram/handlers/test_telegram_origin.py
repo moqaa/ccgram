@@ -210,3 +210,17 @@ def test_pending_correlations_are_not_evicted_before_ttl() -> None:
 
     assert consume_telegram_injection(0, "@0", 42, "message-0") is True
     assert consume_telegram_injection(999, "@burst", 42, "burst-0") is True
+
+
+def test_lost_line_break_still_matches_the_telegram_message() -> None:
+    # Seen 2026-11-25: "first line\nsecond line" reached the transcript as
+    # "first linesecond line" and came back to the topic as a 👤 echo.
+    remember_telegram_injection(1, "@1", 42, "first line\r\nsecond  line ")
+
+    assert consume_telegram_injection(1, "@1", 42, "first linesecond line")
+
+
+def test_different_words_are_not_matched() -> None:
+    remember_telegram_injection(1, "@1", 42, "yo pago")
+
+    assert consume_telegram_injection(1, "@1", 42, "yo no pago") is False

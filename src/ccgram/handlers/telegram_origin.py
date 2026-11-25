@@ -27,7 +27,9 @@ _pending_injections: dict[
 
 
 def _normalize(text: str) -> str:
-    return text.replace("\r\n", "\n").strip()
+    # Whitespace-blind: a line break or spacing lost on the way into the
+    # terminal must not turn the user's own message into a 👤 echo.
+    return "".join(text.split())
 
 
 def _key(user_id: int, window_id: str, thread_id: int, chat_id: int | None):

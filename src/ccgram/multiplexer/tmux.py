@@ -702,6 +702,33 @@ class TmuxManager:
                 window_id, text, **({"pane_id": pane_id} if pane_id else {})
             )
 
+    async def _send_lines(
+        self, window_id: str, text: str, *, pane_id: str | None = None
+    ) -> bool:
+        """Type multi-line text into an agent TUI, keeping its line breaks.
+
+        ``send-keys -l`` drops a newline outright (tmux 3.7 sends "a\\nb" as
+        "ab"), and a plain Enter would submit early. Each break is sent as
+        Shift+Enter, which agent editors read as a new line.
+        """
+        pane_args = {"pane_id": pane_id} if pane_id else {}
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        for index, line in enumerate(lines):
+            if index and not await asyncio.to_thread(
+                self._pane_send,
+                window_id,
+                "S-Enter",
+                enter=False,
+                literal=False,
+                **pane_args,
+            ):
+                return False
+            if line and not await asyncio.to_thread(
+                self._pane_send, window_id, line, enter=False, literal=True, **pane_args
+            ):
+                return False
+        return True
+
     async def _send_literal_then_enter_locked(
         self, window_id: str, text: str, *, pane_id: str | None = None
     ) -> bool:
@@ -717,20 +744,10 @@ class TmuxManager:
             rest = text[1:]
             if rest:
                 await asyncio.sleep(1.0)
-                if not await asyncio.to_thread(
-                    self._pane_send,
-                    window_id,
-                    rest,
-                    enter=False,
-                    literal=True,
-                    **pane_args,
-                ):
+                if not await self._send_lines(window_id, rest, **pane_args):
                     return False
-        else:
-            if not await asyncio.to_thread(
-                self._pane_send, window_id, text, enter=False, literal=True, **pane_args
-            ):
-                return False
+        elif not await self._send_lines(window_id, text, **pane_args):
+            return False
         await asyncio.sleep(0.5)
         return await asyncio.to_thread(
             self._pane_send, window_id, "", enter=True, literal=False, **pane_args
