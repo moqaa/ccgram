@@ -165,7 +165,28 @@ class TmuxManager:
         return session
 
     @staticmethod
-    def _window_ref_for_reconciliation(window: libtmux.Window) -> TmuxWindow:
+    def _focused_panes_by_window(session: libtmux.Session) -> dict[str, libtmux.Pane]:
+        """Map window id to its active pane with one ``list-panes -s`` call.
+
+        ``window.active_pane`` runs ``list-panes`` once per window. Windows
+        missing from the map (or a failed batch) fall back to that per-window
+        query, so pane metadata stays optional exactly as before.
+        """
+        try:
+            panes = session.panes
+        except _TmuxError as exc:
+            logger.debug("Batch pane listing failed: %s", exc)
+            return {}
+        return {
+            pane.window_id: pane
+            for pane in panes
+            if pane.pane_active == "1" and isinstance(pane.window_id, str)
+        }
+
+    @staticmethod
+    def _window_ref_for_reconciliation(
+        window: libtmux.Window, active_pane: libtmux.Pane | None = None
+    ) -> TmuxWindow:
         """Build a window ref while treating pane metadata as optional.
 
         Every window in the session comes back, including the ones
@@ -190,7 +211,7 @@ class TmuxManager:
         pw = 0
         ph = 0
         try:
-            pane = window.active_pane
+            pane = active_pane or window.active_pane
             if pane:
                 cwd = pane.pane_current_path or ""
                 pane_cmd = pane.pane_current_command or ""
@@ -221,6 +242,7 @@ class TmuxManager:
             if not session:
                 return windows
 
+            active = self._focused_panes_by_window(session)
             for window in session.windows:
                 name = window.window_name or ""
                 window_id = window.window_id or ""
@@ -236,7 +258,7 @@ class TmuxManager:
 
                 try:
                     # Get the active pane's current path, command, and dimensions
-                    pane = window.active_pane
+                    pane = active.get(window_id) or window.active_pane
                     if pane:
                         cwd = pane.pane_current_path or ""
                         pane_cmd = pane.pane_current_command or ""
@@ -296,8 +318,11 @@ class TmuxManager:
                 session = self._fetch_session()
                 if session is None:
                     return []
+                active = self._focused_panes_by_window(session)
                 windows = [
-                    self._window_ref_for_reconciliation(window)
+                    self._window_ref_for_reconciliation(
+                        window, active.get(window.window_id or "")
+                    )
                     for window in session.windows
                 ]
             except _TmuxError:
@@ -1254,20 +1279,49 @@ class TmuxManager:
         leader from ``ps``.  ``cwd`` comes from the window's reported cwd.
         Returns None when the window is gone or no foreground process exists.
         """
-        window = await self.find_window_by_id(window_id)
-        if not window or not window.pane_tty:
+        pane = await self._focused_pane_tty_cwd(window_id)
+        if pane is None:
             return None
-        parsed = await self._ps_foreground(window.pane_tty)
+        tty, cwd = pane
+        parsed = await self._ps_foreground(tty)
         if parsed is None:
             return None
         pid, pgid, argv = parsed
-        return ForegroundInfo(
-            pid=pid,
-            pgid=pgid,
-            argv=argv,
-            cwd=window.cwd,
-            tty=window.pane_tty,
+        return ForegroundInfo(pid=pid, pgid=pgid, argv=argv, cwd=cwd, tty=tty)
+
+    async def _focused_pane_tty_cwd(self, window_id: str) -> tuple[str, str] | None:
+        """Return the window's active pane ``(tty, cwd)`` with one tmux call.
+
+        ``find_window_by_id`` rebuilds the whole listing (one ``list-panes`` per
+        window), and the protocol refresh asks this for every window, so the
+        cost grew with the square of the window count: 51 windows took about
+        2,700 tmux processes and 20 s per refresh (2026-11-25).
+        """
+        # list-panes, not display-message: display-message answers with some
+        # other pane when the window is gone. Through libtmux so the server's
+        # socket is honoured, as the listing did.
+        fmt = (
+            "#{pane_active}\t#{session_name}\t#{session_group}"
+            "\t#{pane_tty}\t#{pane_current_path}"
         )
+        try:
+            result = await asyncio.to_thread(
+                self.server.cmd, "list-panes", "-t", window_id, "-F", fmt
+            )
+        except _TmuxError:
+            return None
+        if result.returncode != 0 or result.stderr:
+            return None
+        for line in result.stdout:
+            active, session, group, tty, cwd = (line.split("\t", 4) + [""] * 5)[:5]
+            if active != "1":
+                continue
+            # Same scope as the listing: this session or a session grouped
+            # with it, never a window that lives only in another session.
+            if self.session_name not in (session, group) or not tty:
+                return None
+            return tty, cwd
+        return None
 
     @staticmethod
     async def _ps_foreground(tty_path: str) -> tuple[int, int, list[str]] | None:

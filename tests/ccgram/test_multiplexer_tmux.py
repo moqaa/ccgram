@@ -172,6 +172,54 @@ async def test_reconciliation_listing_is_complete(mgr: TmuxManager) -> None:
     assert [w.topic_eligible for w in windows] == [False, False, True]
 
 
+async def test_reconciliation_listing_reads_active_panes_in_one_batch(
+    mgr: TmuxManager,
+) -> None:
+    """One ``list-panes -s`` for the session, not one query per window."""
+
+    class NoQueryWindow(_FakeWindow):
+        @property
+        def active_pane(self):
+            raise AssertionError("per-window pane query")
+
+    def pane(window_id: str, active: str, path: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            window_id=window_id,
+            pane_active=active,
+            pane_current_path=path,
+            pane_current_command="claude",
+            pane_tty=f"/dev/{window_id[1:]}",
+            pane_width="80",
+            pane_height="24",
+        )
+
+    session = MagicMock()
+    session.windows = [NoQueryWindow("@5", "a"), NoQueryWindow("@6", "b")]
+    session.panes = [
+        pane("@5", "0", "/inactive"),
+        pane("@5", "1", "/five"),
+        pane("@6", "1", "/six"),
+    ]
+
+    with patch.object(mgr, "_fetch_session", return_value=session):
+        windows = await mgr.list_windows_for_reconciliation()
+
+    assert windows is not None
+    assert [(w.window_id, w.cwd, w.pane_tty) for w in windows] == [
+        ("@5", "/five", "/dev/5"),
+        ("@6", "/six", "/dev/6"),
+    ]
+
+
+def test_active_panes_falls_back_when_the_batch_fails() -> None:
+    class FailingSession:
+        @property
+        def panes(self):
+            raise OSError("tmux busy")
+
+    assert TmuxManager._focused_panes_by_window(FailingSession()) == {}  # type: ignore[arg-type]
+
+
 def test_reconciliation_window_keeps_identity_when_pane_query_fails() -> None:
     class FailedPaneWindow:
         window_id = "@7"
@@ -375,10 +423,7 @@ async def test_pane_dims_returns_none_on_error(mgr: TmuxManager, monkeypatch) ->
 
 
 async def test_foreground_builds_info(mgr: TmuxManager) -> None:
-    win = WindowRef(
-        window_id="@0", window_name="proj", cwd="/work", pane_tty="/dev/ttys003"
-    )
-    mgr.find_window_by_id = AsyncMock(return_value=win)  # type: ignore[method-assign]
+    mgr._focused_pane_tty_cwd = AsyncMock(return_value=("/dev/ttys003", "/work"))  # type: ignore[method-assign]
     mgr._ps_foreground = AsyncMock(return_value=(321, 321, ["claude", "--continue"]))  # type: ignore[method-assign]
 
     info = await mgr.foreground("@0")
@@ -389,17 +434,81 @@ async def test_foreground_builds_info(mgr: TmuxManager) -> None:
         cwd="/work",
         tty="/dev/ttys003",
     )
-
-
-async def test_foreground_none_without_tty(mgr: TmuxManager) -> None:
-    win = WindowRef(window_id="@0", window_name="proj", cwd="/work", pane_tty="")
-    mgr.find_window_by_id = AsyncMock(return_value=win)  # type: ignore[method-assign]
-    assert await mgr.foreground("@0") is None
+    mgr._ps_foreground.assert_awaited_once_with("/dev/ttys003")
 
 
 async def test_foreground_none_when_window_gone(mgr: TmuxManager) -> None:
-    mgr.find_window_by_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    mgr._focused_pane_tty_cwd = AsyncMock(return_value=None)  # type: ignore[method-assign]
     assert await mgr.foreground("@0") is None
+
+
+async def test_foreground_never_rebuilds_the_window_listing(
+    mgr: TmuxManager,
+) -> None:
+    """One window's foreground must not cost a full listing (2026-11-25).
+
+    The protocol refresh asks this for every window; through the listing it
+    cost ~2,700 tmux processes and 20 s per refresh at 51 windows.
+    """
+    mgr.list_windows_for_reconciliation = AsyncMock()  # type: ignore[method-assign]
+    mgr._focused_pane_tty_cwd = AsyncMock(return_value=("/dev/ttys003", "/work"))  # type: ignore[method-assign]
+    mgr._ps_foreground = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    await mgr.foreground("@0")
+
+    mgr.list_windows_for_reconciliation.assert_not_awaited()
+
+
+def _list_panes_result(lines: list[str], returncode: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(
+        stdout=lines,
+        stderr=[] if returncode == 0 else ["can't find window"],
+        returncode=returncode,
+    )
+
+
+async def test_focused_pane_tty_cwd_reads_one_list_panes(mgr: TmuxManager) -> None:
+    server = MagicMock()
+    server.cmd.return_value = _list_panes_result(
+        [
+            "0\tccgram-test\t\t/dev/ttys001\t/other",
+            "1\tccgram-test\t\t/dev/ttys003\t/work/my dir",
+        ]
+    )
+    mgr._server = server
+
+    assert await mgr._focused_pane_tty_cwd("@5") == ("/dev/ttys003", "/work/my dir")
+    server.cmd.assert_called_once()
+    assert server.cmd.call_args.args[:3] == ("list-panes", "-t", "@5")
+
+
+async def test_focused_pane_accepts_a_session_grouped_with_ours(
+    mgr: TmuxManager,
+) -> None:
+    server = MagicMock()
+    server.cmd.return_value = _list_panes_result(
+        ["1\twt-0000000000-001\tccgram-test\t/dev/ttys027\t/work"]
+    )
+    mgr._server = server
+    assert await mgr._focused_pane_tty_cwd("@10") == ("/dev/ttys027", "/work")
+
+
+@pytest.mark.parametrize(
+    ("lines", "returncode"),
+    [
+        pytest.param([], 1, id="window-gone"),
+        pytest.param(["1\tccgram-test\t\t\t/work"], 0, id="no-tty"),
+        pytest.param(["1\tother\t\t/dev/ttys009\t/work"], 0, id="other-session"),
+        pytest.param(["0\tccgram-test\t\t/dev/ttys009\t/work"], 0, id="no-active"),
+    ],
+)
+async def test_focused_pane_tty_cwd_none_outside_our_live_window(
+    mgr: TmuxManager, lines: list[str], returncode: int
+) -> None:
+    server = MagicMock()
+    server.cmd.return_value = _list_panes_result(lines, returncode)
+    mgr._server = server
+    assert await mgr._focused_pane_tty_cwd("@5") is None
 
 
 # ── _parse_ps_line (pure) ──────────────────────────────────────────────
